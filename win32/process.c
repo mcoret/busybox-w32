@@ -116,28 +116,12 @@ parse_interpreter(const char *cmd, interp_t *interp)
 char *
 quote_arg(const char *arg)
 {
-	int force_quotes = 0;
 	char *r = xmalloc(2 * strlen(arg) + 3);  // max-esc, enclosing DQ, \0
 	char *d = r;
 	int nbs = 0;  // n consecutive BS right before current char
-	const char *p = arg;
 
-	/* empty arguments must be quoted */
-	if (!*p) {
-		force_quotes = 1;
-	}
-
-	while (*p) {
-		if (isspace(*p)) {
-			/* arguments containing whitespace must be quoted */
-			force_quotes = 1;
-			break;
-		}
-		p++;
-	}
-
-	/* insert double quotes and backslashes where necessary */
-	if (force_quotes) {
+	/* empty arguments and those containing tab/space must be quoted */
+	if (!*arg || strpbrk(arg, " \t")) {
 		*d++ = '"';
 	}
 
@@ -156,7 +140,7 @@ quote_arg(const char *arg)
 		*d++ = *arg++;
 	}
 
-	if (force_quotes) {
+	if (*r == '"') {
 		while (nbs--)  // double consecutive-BS before the closing DQ
 			*d++ = '\\';
 		*d++ = '"';
@@ -259,6 +243,19 @@ mingw_spawn_applet(int mode,
 }
 #endif
 
+/* Make a copy of an argv array with n extra slots at the start */
+char ** FAST_FUNC
+grow_argv(char **argv, int n)
+{
+	char **new_argv;
+	int argc;
+
+	argc = string_array_len(argv) + 1;
+	new_argv = xmalloc(sizeof(*argv) * (argc + n));
+	memcpy(new_argv + n, argv, sizeof(*argv) * argc);
+	return new_argv;
+}
+
 static intptr_t
 mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 			char *const *envp, int level)
@@ -267,7 +264,6 @@ mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 	int nopts;
 	interp_t interp;
 	char **new_argv;
-	int argc;
 	char *path = NULL;
 
 	if (!parse_interpreter(prog, &interp))
@@ -279,11 +275,9 @@ mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 	}
 
 	nopts = interp.opts != NULL;
-	argc = string_array_len((char **)argv);
-	new_argv = xmalloc(sizeof(*argv)*(argc+nopts+2));
+	new_argv = grow_argv((char **)(argv + 1), nopts + 2);
 	new_argv[1] = interp.opts;
 	new_argv[nopts+1] = (char *)prog; /* pass absolute path */
-	memcpy(new_argv+nopts+2, argv+1, sizeof(*argv)*argc);
 
 #if ENABLE_FEATURE_PREFER_APPLETS && NUM_APPLETS > 1
 	if (unix_path(interp.path) && find_applet_by_name(interp.name) >= 0) {
