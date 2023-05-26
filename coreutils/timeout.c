@@ -54,7 +54,7 @@ static HANDLE child = INVALID_HANDLE_VALUE;
 static void kill_child(void)
 {
 	if (child != INVALID_HANDLE_VALUE) {
-		kill_SIGTERM_by_handle(child);
+		kill_signal_by_handle(child, SIGTERM);
 	}
 }
 
@@ -97,11 +97,11 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 	int signo;
 #if !ENABLE_PLATFORM_MINGW32
 	int status;
+	int parent = 0;
 #else
 	intptr_t ret;
 	DWORD status = EXIT_SUCCESS;
 #endif
-	int parent = 0;
 	int timeout;
 	int kill_timeout;
 	pid_t pid;
@@ -119,14 +119,18 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 
 	/* -t SECONDS; -p PARENT_PID */
 	/* '+': stop at first non-option */
+#if !ENABLE_PLATFORM_MINGW32
 	getopt32(argv, "+s:k:" USE_FOR_NOMMU("p:+"), &opt_s, &opt_k, &parent);
+#else
+	getopt32(argv, "+s:k:", &opt_s, &opt_k);
+#endif
 	/*argv += optind; - no, wait for bb_daemonize_or_rexec! */
 
 	signo = get_signum(opt_s);
 #if !ENABLE_PLATFORM_MINGW32
 	if (signo < 0)
 #else
-	if (signo != SIGTERM && signo != SIGKILL && signo != 0)
+	if (!is_valid_signal(signo))
 #endif
 		bb_error_msg_and_die("unknown signal '%s'", opt_s);
 
@@ -212,7 +216,7 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 	if (kill_timeout > 0) {
 		if (timeout_wait(kill_timeout, child, &status))
 			goto finish;
-		kill(parent, SIGKILL);
+		kill(pid, SIGKILL);
 		status = 137;
 	}
  finish:
