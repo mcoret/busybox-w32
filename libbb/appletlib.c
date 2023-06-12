@@ -76,13 +76,6 @@ static inline int *get_perrno(void) { return &errno; }
 static const char packed_scripts[] ALIGN1 = { PACKED_SCRIPTS };
 #endif
 
-#if defined(find_applet_by_name)
-# undef find_applet_by_name
-#endif
-#if defined(is_applet_preferred)
-# undef is_applet_preferred
-#endif
-
 /* "Do not compress usage text if uncompressed text is small
  *  and we don't include bunzip2 code for other reasons"
  *
@@ -245,7 +238,7 @@ int FAST_FUNC find_applet_by_name(const char *name)
 		for (j = 0; *p == name[j]; ++j) {
 			if (*p++ == '\0') {
 				//bb_error_msg("found:'%s' i:%u", name, i);
-				return i; /* yes */
+				return is_applet_preferred(name) ? i : -1; /* yes */
 			}
 		}
 		/* No. Have we gone too far, alphabetically? */
@@ -263,18 +256,35 @@ int FAST_FUNC find_applet_by_name(const char *name)
 
 #if ENABLE_PLATFORM_MINGW32 && NUM_APPLETS > 1 && \
 		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
+static int external_exists(const char *name)
+{
+	const char *ash_path = get_ash_path();
+	char *path = ash_path ? auto_string(xstrdup(ash_path)) : getenv("PATH");
+	char *ret = find_executable(name, &path);
+	free(ret);
+	return ret != NULL;
+}
+
 int FAST_FUNC is_applet_preferred(const char *name)
 {
-	const char *var, *s;
+	const char *var, *s, *sep;
 	size_t len;
 
 	var = getenv(BB_OVERRIDE_APPLETS);
 	if (var && *var) {
-		/* '-' overrides all applets */
+		/* '-' disables all applets */
 		if (var[0] == '-' && var[1] == '\0')
 			return FALSE;
 
-		/* Override applets from a space-separated list */
+		/* '+' each applet is overridden if an external command exists */
+		if (var[0] == '+' && var[1] == '\0')
+			return !external_exists(name);
+
+		/* Handle applets from a list separated by spaces, commas or
+		 * semicolons.  Applets before the first semicolon are disabled.
+		 * Applets after the first semicolon are overridden if a
+		 * corresponding external command exists. */
+		sep = strchr(var, ';');
 		len = strlen(name);
 		s = var - 1;
 		while (1) {
@@ -282,21 +292,15 @@ int FAST_FUNC is_applet_preferred(const char *name)
 			if (!s)
 				break;
 			/* neither "name.." nor "xxx,name.."? */
-			if (s != var && s[-1] != ' ')
+			if (s != var && !strchr(" ,;", s[-1]))
 				continue;
 			/* neither "..name" nor "..name,xxx"? */
-			if (s[len] != '\0' && s[len] != ' ')
+			if (s[len] != '\0' && !strchr(" ,;", s[len]))
 				continue;
-			return FALSE;
+			return (sep == NULL || s < sep) ? FALSE : !external_exists(name);
 		}
 	}
 	return TRUE;
-}
-
-int FAST_FUNC find_preferred_applet_by_name(const char *name)
-{
-	int applet_no = find_applet_by_name(name);
-	return applet_no >= 0 && is_applet_preferred(name) ? applet_no : -1;
 }
 #endif
 

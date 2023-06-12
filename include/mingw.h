@@ -150,6 +150,7 @@ IMPL(setlinebuf, void, ,FILE * UNUSED_PARAM)
  * ANSI emulation wrappers
  */
 
+BOOL winansi_OemToCharBuff(LPCSTR s, LPSTR d, DWORD len);
 void set_title(const char *str);
 void move_cursor_row(int n);
 void reset_screen(void);
@@ -165,6 +166,10 @@ int winansi_fprintf(FILE *stream, const char *format, ...) __attribute__((format
 int winansi_write(int fd, const void *buf, size_t count);
 int winansi_read(int fd, void *buf, size_t count);
 int winansi_getc(FILE *stream);
+#if ENABLE_FEATURE_EURO
+# undef OemToCharBuff
+# define OemToCharBuff winansi_OemToCharBuff
+#endif
 #define putchar winansi_putchar
 #define puts winansi_puts
 #define fwrite winansi_fwrite
@@ -577,7 +582,7 @@ ULONGLONG CompatGetTickCount64(void);
 
 ssize_t get_random_bytes(void *buf, ssize_t count);
 int enumerate_links(const char *file, char *name);
-void hide_console(void);
+void hide_console(int);
 
 int unc_root_len(const char *dir);
 int root_len(const char *path);

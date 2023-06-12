@@ -153,16 +153,8 @@ quote_arg(const char *arg)
 char *
 find_first_executable(const char *name)
 {
-	char *tmp, *path = getenv("PATH");
-	char *exe_path = NULL;
-
-	if (path) {
-		tmp = path = xstrdup(path);
-		exe_path = find_executable(name, &tmp);
-		free(path);
-	}
-
-	return exe_path;
+	char *path = getenv("PATH");
+	return find_executable(name, &path);
 }
 
 static intptr_t
@@ -373,6 +365,7 @@ BOOL WINAPI kill_child_ctrl_handler(DWORD dwCtrlType)
 {
 	static pid_t child_pid = 0;
 	DWORD dummy, *procs, count, rcount, i;
+	DECLARE_PROC_ADDR(DWORD, GetConsoleProcessList, LPDWORD, DWORD);
 
 	if (child_pid == 0) {
 		// First call sets child pid
@@ -381,6 +374,9 @@ BOOL WINAPI kill_child_ctrl_handler(DWORD dwCtrlType)
 	}
 
 	if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT) {
+		if (!INIT_PROC_ADDR(kernel32.dll, GetConsoleProcessList))
+			return TRUE;
+
 		count = GetConsoleProcessList(&dummy, 1) + 16;
 		procs = malloc(sizeof(DWORD) * count);
 		rcount = GetConsoleProcessList(procs, count);
