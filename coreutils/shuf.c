@@ -7,7 +7,7 @@
  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
  */
 //config:config SHUF
-//config:	bool "shuf (5.4 kb)"
+//config:	bool "shuf (6 kb)"
 //config:	default y
 //config:	help
 //config:	Generate random permutations
@@ -212,7 +212,7 @@ int shuf_main(int argc, char **argv)
 				printf("%.*s%0*llu%c", pfx_len, pfx, padding_width, lo + (uintptr_t)lines[i], eol);
 			else
 #endif
-				printf("%llu%c", lo + (uintptr_t)lines[i], eol);
+				printf("%"LL_FMT"u%c", lo + (uintptr_t)lines[i], eol);
 		} else
 			printf("%s%c", lines[i], eol);
 	}

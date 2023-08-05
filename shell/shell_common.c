@@ -22,6 +22,25 @@
 const char defifsvar[] ALIGN1 = "IFS= \t\n";
 const char defoptindvar[] ALIGN1 = "OPTIND=1";
 
+/* Compare two strings up to the first '=' or '\0'. */
+int FAST_FUNC varcmp(const char *p, const char *q)
+{
+	int c, d;
+
+	while ((c = *p) == (d = *q)) {
+		if (c == '\0' || c == '=')
+			goto out;
+		p++;
+		q++;
+	}
+	if (c == '=')
+		c = '\0';
+	if (d == '=')
+		d = '\0';
+ out:
+	return c - d;
+}
+
 /* read builtin */
 
 /* Needs to be interruptible: shell must handle traps and shell-special signals
@@ -59,7 +78,7 @@ shell_builtin_read(struct builtin_read_params *params)
 	argv = params->argv;
 	pp = argv;
 	while (*pp) {
-		if (endofname(*pp)[0] != '\0') {
+		if (!*pp[0] || endofname(*pp)[0] != '\0') {
 			/* Mimic bash message */
 			bb_error_msg("read: '%s': bad variable name", *pp);
 			return (const char *)(uintptr_t)1;
@@ -195,7 +214,6 @@ shell_builtin_read(struct builtin_read_params *params)
 			}
 		}
 
-#if !ENABLE_PLATFORM_MINGW32
 		/* We must poll even if timeout is -1:
 		 * we want to be interrupted if signal arrives,
 		 * regardless of SA_RESTART-ness of that signal!
@@ -209,13 +227,7 @@ shell_builtin_read(struct builtin_read_params *params)
 			retval = (const char *)(uintptr_t)1;
 			goto ret;
 		}
-		if (read(fd, &buffer[bufpos], 1) != 1) {
-			err = errno;
-			retval = (const char *)(uintptr_t)1;
-			break;
-		}
-#else
-		errno = 0;
+#if ENABLE_PLATFORM_MINGW32
 		if (isatty(fd)) {
 			int64_t key;
 
@@ -235,7 +247,7 @@ shell_builtin_read(struct builtin_read_params *params)
 					--bufpos;
 					++nchars;
 					if (!(read_flags & BUILTIN_READ_SILENT)) {
-						printf("\b \b");
+						console_write("\b \b", 3);
 					}
 				}
 				goto loop;
@@ -243,17 +255,15 @@ shell_builtin_read(struct builtin_read_params *params)
 			buffer[bufpos] = key == '\r' ? '\n' : key;
 			if (!(read_flags & BUILTIN_READ_SILENT)) {
 				/* echo input if not in silent mode */
-				putchar(buffer[bufpos]);
+				console_write(buffer + bufpos, 1);
 			}
-		}
-		else {
-			if (read(fd, &buffer[bufpos], 1) != 1) {
-				err = errno;
-				retval = (const char *)(uintptr_t)1;
-				break;
-			}
-		}
+		} else
 #endif
+		if (read(fd, &buffer[bufpos], 1) != 1) {
+			err = errno;
+			retval = (const char *)(uintptr_t)1;
+			break;
+		}
 
 		c = buffer[bufpos];
 #if ENABLE_PLATFORM_MINGW32

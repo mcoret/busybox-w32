@@ -35,7 +35,7 @@
 //config:	depends on !NOMMU
 //config:
 //config:config ASH
-//config:	bool "ash (78 kb)"
+//config:	bool "ash (80 kb)"
 //config:	default y
 //config:	depends on !NOMMU
 //config:	select SHELL_ASH
@@ -149,11 +149,23 @@
 //config:	default y
 //config:	depends on SHELL_ASH
 //config:
-//config:config ASH_SLEEP
-//config:	bool "sleep builtin"
-//config:	default y
-//config:	depends on SHELL_ASH
-//config:
+//
+////config:config ASH_SLEEP
+////config:	bool "sleep builtin"
+////config:	default y
+////config:	depends on SHELL_ASH
+////config:
+//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//Disabled for now. Has a few annoying problems:
+// * sleepcmd() -> sleep_main(), the parsing of bad arguments exits the shell.
+// * sleep_for_duration() in sleep_main() has to be interruptible for
+//   ^C traps to work, which may be a problem for other users
+//   of sleep_for_duration().
+// * BUT, if sleep_for_duration() is interruptible, then SIGCHLD interrupts it
+//   as well (try "/bin/sleep 1 & sleep 10").
+// * sleep_main() must not allocate anything as ^C in ash longjmp's.
+//   (currently, allocations are only on error paths, in message printing).
+//
 //config:config ASH_HELP
 //config:	bool "help builtin"
 //config:	default y
@@ -599,7 +611,12 @@ struct globals_misc {
 
 	struct jmploc *exception_handler;
 
-	volatile int suppress_int; /* counter */
+	/*volatile*/ int suppress_int; /* counter */
+	/* ^^^^^^^ removed "volatile" since on x86, gcc turns suppress_int++
+	 * into ridiculous 3-insn sequence otherwise.
+	 * We don't change suppress_int asyncronously (in a signal handler),
+	 * but we do read it async.
+	 */
 	volatile /*sig_atomic_t*/ smallint pending_int; /* 1 = got SIGINT */
 #if !ENABLE_PLATFORM_MINGW32
 	volatile /*sig_atomic_t*/ smallint got_sigchld; /* 1 = got SIGCHLD */
@@ -954,7 +971,8 @@ int_on(void)
 {
 	barrier();
 	if (--suppress_int == 0 && pending_int)
-		raise_interrupt();
+		raise_interrupt(); /* does not return */
+	barrier();
 }
 #if DEBUG_INTONOFF
 # define INT_ON do { \
@@ -970,7 +988,8 @@ force_int_on(void)
 	barrier();
 	suppress_int = 0;
 	if (pending_int)
-		raise_interrupt();
+		raise_interrupt(); /* does not return */
+	barrier();
 }
 #define FORCE_INT_ON force_int_on()
 
@@ -980,7 +999,8 @@ force_int_on(void)
 	barrier(); \
 	suppress_int = (v); \
 	if (suppress_int == 0 && pending_int) \
-		raise_interrupt(); \
+		raise_interrupt(); /* does not return */ \
+	barrier(); \
 } while (0)
 
 
@@ -2355,6 +2375,9 @@ struct localvar {
 #else
 # define VDYNAMIC       0
 #endif
+#if ENABLE_PLATFORM_MINGW32
+# define VIMPORT        0x400   /* variable was imported from environment */
+#endif
 
 
 /* Need to be before varinit_data[] */
@@ -2542,30 +2565,6 @@ getoptsreset(const char *value)
 	shellparam.optoff = -1;
 }
 #endif
-
-/*
- * Compares two strings up to the first = or '\0'.  The first
- * string must be terminated by '='; the second may be terminated by
- * either '=' or '\0'.
- */
-static int
-varcmp(const char *p, const char *q)
-{
-	int c, d;
-
-	while ((c = *p) == (d = *q)) {
-		if (c == '\0' || c == '=')
-			goto out;
-		p++;
-		q++;
-	}
-	if (c == '=')
-		c = '\0';
-	if (d == '=')
-		d = '\0';
- out:
-	return c - d;
-}
 
 /*
  * Find the appropriate entry in the hash table from the name.
@@ -2878,7 +2877,7 @@ setvar(const char *name, const char *val, int flags)
 	p = mempcpy(nameeq, name, namelen);
 	if (val) {
 		*p++ = '=';
-		memcpy(p, val, vallen);
+		strcpy(p, val);
 	}
 	vp = setvareq(nameeq, flags | VNOSAVE);
 	INT_ON;
@@ -2962,6 +2961,36 @@ listvars(int on, int off, struct strlist *lp, char ***end)
 	*ep++ = NULL;
 	return grabstackstr(ep);
 }
+
+#if ENABLE_PLATFORM_MINGW32
+/* Adjust directory separator in variables imported from the environment */
+static void
+setwinxp(int on)
+{
+	static smallint is_winxp;
+	struct var **vpp;
+	struct var *vp;
+
+	if (++on == is_winxp)
+		return;
+	is_winxp = on;
+
+	for (vpp = vartab; vpp < vartab + VTABSIZE; vpp++) {
+		for (vp = *vpp; vp; vp = vp->next) {
+			if ((vp->flags & VIMPORT)) {
+				char *end = strchr(vp->var_text, '=');
+				if (!end || is_prefixed_with(vp->var_text, "COMSPEC=") ||
+						is_prefixed_with(vp->var_text, "SYSTEMROOT="))
+					continue;
+				if (!winxp)
+					bs_to_slash(end + 1);
+				else
+					slash_to_bs(end + 1);
+			}
+		}
+	}
+}
+#endif
 
 
 /* ============ Path search helper */
@@ -10452,7 +10481,7 @@ evaltree(union node *n, int flags)
 	}
 	if (flags & EV_EXIT) {
  exexit:
-		raise_exception(EXEND);
+		raise_exception(EXEND); /* does not return */
 	}
 
 	popstackmark(&smark);
@@ -10840,6 +10869,9 @@ optschanged(void)
 #endif
 #if ENABLE_ASH_NOCONSOLE
 	hide_console(noconsole);
+#endif
+#if ENABLE_PLATFORM_MINGW32
+	setwinxp(winxp);
 #endif
 }
 
@@ -11518,7 +11550,7 @@ evalcommand(union node *cmd, int flags)
 
 		/* We have a redirection error. */
 		if (spclbltin > 0)
-			raise_exception(EXERROR);
+			raise_exception(EXERROR); /* does not return */
 
 		goto out;
 	}
@@ -13311,18 +13343,19 @@ simplecmd(void)
 			if (args && app == &args->narg.next
 			 && !vars && !redir
 			) {
-				struct builtincmd *bcmd;
-				const char *name;
+//				struct builtincmd *bcmd;
+//				const char *name;
 
 				/* We have a function */
 				if (IF_BASH_FUNCTION(!function_flag &&) readtoken() != TRP)
 					raise_error_unexpected_syntax(TRP);
-				name = n->narg.text;
-				if (!goodname(name)
-				 || ((bcmd = find_builtin(name)) && IS_BUILTIN_SPECIAL(bcmd))
-				) {
-					raise_error_syntax("bad function name");
-				}
+//bash allows functions named "123", "..", "return"!
+//				name = n->narg.text;
+//				if (!goodname(name)
+//				 || ((bcmd = find_builtin(name)) && IS_BUILTIN_SPECIAL(bcmd))
+//				) {
+//					raise_error_syntax("bad function name");
+//				}
 				n->type = NDEFUN;
 				checkkwd = CHKNL | CHKKWD | CHKALIAS;
 				n->ndefun.text = n->narg.text;
@@ -15739,8 +15772,8 @@ exitshell(void)
  out:
 #if ENABLE_SUW32
 	if (delayexit) {
-		freopen("CONOUT$", "w", stdout);
-		fputs_stdout("Press any key to exit...");
+#define EXIT_MSG "Press any key to exit..."
+		console_write(EXIT_MSG, sizeof(EXIT_MSG) - 1);
 		_getch();
 	}
 #endif
@@ -15757,10 +15790,10 @@ exitshell(void)
 #if ENABLE_PLATFORM_MINGW32
 /* We need to see if HOME is *really* unset */
 # undef getenv
-static void xsetenv_if_unset(const char *key, const char *value)
+static void setvar_if_unset(const char *key, const char *value)
 {
 	if (!getenv(key) || getuid() == 0)
-		xsetenv(key, value);
+		setvar(key, value, VEXPORT);
 }
 #endif
 
@@ -15768,7 +15801,9 @@ static void xsetenv_if_unset(const char *key, const char *value)
 static NOINLINE void
 init(void)
 {
-#if !ENABLE_PLATFORM_MINGW32
+#if ENABLE_PLATFORM_MINGW32
+	int import = 0;
+#else
 	/* we will never free this */
 	basepf.next_to_pgetc = basepf.buf = ckmalloc(IBUFSIZ);
 	basepf.linno = 1;
@@ -15810,54 +15845,39 @@ init(void)
 			char *start, *end;
 			struct passwd *pw;
 
+			import = VIMPORT;
 			for (envp = environ; envp && *envp; envp++) {
 				if (!(end=strchr(*envp, '=')))
 					continue;
 
-				/* make all variable names uppercase */
-				for (start = *envp;start < end;start++)
-					*start = toupper(*start);
-
-				/* Convert backslashes to forward slashes in value but
-				 * not if we're on Windows XP or for variables known to
-				 * cause problems */
-				if (!winxp && !is_prefixed_with(*envp, "SYSTEMROOT=") &&
-						!is_prefixed_with(*envp, "COMSPEC=")) {
-					bs_to_slash(end+1);
-				}
-
 				/* check for invalid characters in name */
-				for (start = *envp;start < end;start++) {
-					if (!isdigit(*start) && !isalpha(*start) && *start != '_') {
-						break;
-					}
-				}
+				start = (char *)endofname(*envp);
+				if (*start != '=') {
+					/* Make a copy of the original variable */
+					setvareq(xstrdup(*envp), VEXPORT|VNOSAVE);
 
-				if (start != end) {
-					/*
-					 * Make a copy of the variable, replacing invalid
-					 * characters in the name with underscores.
-					 */
-					char *var = xstrdup(*envp);
-
-					for (start = var;*start != '=';start++) {
-						if (!isdigit(*start) && !isalpha(*start)) {
+					/* Replace invalid characters with underscores */
+					for (; start < end; start++) {
+						if (!isalnum(*start)) {
 							*start = '_';
 						}
 					}
-					setvareq(var, VEXPORT|VNOSAVE);
 				}
+
+				/* make all variable names uppercase */
+				for (start = *envp;start < end;start++)
+					*start = toupper(*start);
 			}
 
 			/* Initialise some variables normally set at login, but
 			 * only if someone hasn't already set them or we're root. */
 			pw = getpwuid(getuid());
 			if (pw) {
-				xsetenv_if_unset("USER",     pw->pw_name);
-				xsetenv_if_unset("LOGNAME",  pw->pw_name);
-				xsetenv_if_unset("HOME",     pw->pw_dir);
+				setvar_if_unset("USER",     pw->pw_name);
+				setvar_if_unset("LOGNAME",  pw->pw_name);
+				setvar_if_unset("HOME",     pw->pw_dir);
 			}
-			xsetenv_if_unset("SHELL",   DEFAULT_SHELL);
+			setvar_if_unset("SHELL",   DEFAULT_SHELL);
 		}
 #endif
 		for (envp = environ; envp && *envp; envp++) {
@@ -15876,7 +15896,7 @@ init(void)
 #if !ENABLE_PLATFORM_MINGW32
 				setvareq(*envp, VEXPORT|VTEXTFIXED);
 #else
-				setvareq(*envp, VEXPORT);
+				setvareq(*envp, VEXPORT|import);
 #endif
 			}
 		}
@@ -15941,7 +15961,7 @@ procargs(char **argv)
 		optlist[i] = 2;
 	if (options(&login_sh)) {
 		/* it already printed err message */
-		raise_exception(EXERROR);
+		raise_exception(EXERROR); /* does not return */
 	}
 	xargv = argptr;
 	xminusc = minusc;
@@ -16109,9 +16129,6 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 	exception_handler = &jmploc;
 	rootpid = getpid();
 
-#if ENABLE_PLATFORM_MINGW32
-	winxp = (argv[1] != NULL && strcmp(argv[1], "-X") == 0);
-#endif
 	init();
 	setstackmark(&smark);
 

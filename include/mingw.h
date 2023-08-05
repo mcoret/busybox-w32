@@ -144,13 +144,18 @@ pid_t mingw_fork_compressor(int fd, const char *compressor, const char *mode);
 #define popen mingw_popen
 #define pclose mingw_pclose
 
-IMPL(setlinebuf, void, ,FILE * UNUSED_PARAM)
+IMPL(setlinebuf, void, ,FILE *fd UNUSED_PARAM)
 
 /*
  * ANSI emulation wrappers
  */
 
-BOOL winansi_OemToCharBuff(LPCSTR s, LPSTR d, DWORD len);
+BOOL conToCharBuffA(LPSTR d, DWORD len);
+BOOL conToCharA(LPSTR d);
+
+// same as ReadConsoleInputA, but delivers UTF8 regardless of console CP
+BOOL readConsoleInput_utf8(HANDLE h, INPUT_RECORD *r, DWORD len, DWORD *got);
+
 void set_title(const char *str);
 void move_cursor_row(int n);
 void reset_screen(void);
@@ -165,11 +170,12 @@ int winansi_printf(const char *format, ...) __attribute__((format (printf, 1, 2)
 int winansi_fprintf(FILE *stream, const char *format, ...) __attribute__((format (printf, 2, 3)));
 int winansi_write(int fd, const void *buf, size_t count);
 int winansi_read(int fd, void *buf, size_t count);
+size_t winansi_fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 int winansi_getc(FILE *stream);
-#if ENABLE_FEATURE_EURO
-# undef OemToCharBuff
-# define OemToCharBuff winansi_OemToCharBuff
-#endif
+int winansi_getchar(void);
+char *winansi_fgets(char *s, int size, FILE *stream);
+void console_write(const char *str, int len);
+
 #define putchar winansi_putchar
 #define puts winansi_puts
 #define fwrite winansi_fwrite
@@ -184,7 +190,11 @@ int winansi_getc(FILE *stream);
 #define fprintf(...) winansi_fprintf(__VA_ARGS__)
 #define write winansi_write
 #define read winansi_read
+#define fread winansi_fread
 #define getc winansi_getc
+#define fgetc winansi_getc
+#define getchar winansi_getchar
+#define fgets winansi_fgets
 
 /*
  * stdlib.h
@@ -284,6 +294,7 @@ time_t timegm(struct tm *tm);
 
 int nanosleep(const struct timespec *req, struct timespec *rem);
 int clock_gettime(clockid_t clockid, struct timespec *tp);
+int clock_settime(clockid_t clockid, const struct timespec *tp);
 
 /*
  * sys/stat.h
@@ -477,6 +488,10 @@ int mingw_open (const char *filename, int oflags, ...);
 int mingw_xopen(const char *filename, int oflags);
 ssize_t mingw_open_read_close(const char *fn, void *buf, size_t size) FAST_FUNC;
 
+#ifndef IO_REPARSE_TAG_APPEXECLINK
+# define IO_REPARSE_TAG_APPEXECLINK 0x8000001b
+#endif
+
 ssize_t mingw_read(int fd, void *buf, size_t count);
 int mingw_close(int fd);
 int pipe(int filedes[2]);
@@ -570,6 +585,18 @@ int has_exe_suffix_or_dot(const char *name);
 char *alloc_ext_space(const char *path);
 int add_win32_extension(char *p);
 char *file_is_win32_exe(const char *name);
+
+#if ENABLE_UNICODE_SUPPORT
+/*
+ * windows wchar_t is 16 bit, while linux (and busybox expectation) is 32.
+ * so when (busybox) unicode.h is included, wchar_t is 32 bit.
+ * Without unicode.h, MINGW_BB_WCHAR_T is busybox wide char (32),
+ * and wchar_t is Windows wide char (16).
+ */
+#define MINGW_BB_WCHAR_T uint32_t  /* keep in sync with unicode.h */
+
+MINGW_BB_WCHAR_T *bs_to_slash_u(MINGW_BB_WCHAR_T *p) FAST_FUNC;
+#endif
 
 char *bs_to_slash(char *p) FAST_FUNC;
 void slash_to_bs(char *p) FAST_FUNC;

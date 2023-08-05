@@ -1008,6 +1008,29 @@ int clock_gettime(clockid_t clockid, struct timespec *tp)
 	return 0;
 }
 
+int clock_settime(clockid_t clockid, const struct timespec *tp)
+{
+	SYSTEMTIME st;
+	FILETIME ft;
+
+	if (clockid != CLOCK_REALTIME) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	timespec_to_filetime(*tp, &ft);
+	if (FileTimeToSystemTime(&ft, &st) == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (SetSystemTime(&st) == 0) {
+		errno = EPERM;
+		return -1;
+	}
+	return 0;
+}
+
 int pipe(int filedes[2])
 {
 	if (_pipe(filedes, PIPE_BUF, 0) < 0)
@@ -2095,6 +2118,20 @@ char * FAST_FUNC bs_to_slash(char *str)
 	}
 	return str;
 }
+
+#if ENABLE_UNICODE_SUPPORT
+MINGW_BB_WCHAR_T * FAST_FUNC bs_to_slash_u(MINGW_BB_WCHAR_T *str)
+{
+	MINGW_BB_WCHAR_T *p;
+
+	for (p=str; *p; ++p) {
+		if ( *p == '\\' ) {
+			*p = '/';
+		}
+	}
+	return str;
+}
+#endif
 
 void FAST_FUNC slash_to_bs(char *p)
 {
