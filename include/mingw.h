@@ -495,7 +495,6 @@ ssize_t mingw_open_read_close(const char *fn, void *buf, size_t size) FAST_FUNC;
 ssize_t mingw_read(int fd, void *buf, size_t count);
 int mingw_close(int fd);
 int pipe(int filedes[2]);
-ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
 NOIMPL(setgid,gid_t gid UNUSED_PARAM);
 NOIMPL(setegid,gid_t gid UNUSED_PARAM);
 NOIMPL(setsid,void);
@@ -609,7 +608,6 @@ ULONGLONG CompatGetTickCount64(void);
 
 ssize_t get_random_bytes(void *buf, ssize_t count);
 int enumerate_links(const char *file, char *name);
-void hide_console(int);
 
 int unc_root_len(const char *dir);
 int root_len(const char *path);

@@ -252,6 +252,7 @@
 #endif
 #if ENABLE_PLATFORM_MINGW32
 # include <conio.h>
+# include "lazyload.h"
 #endif
 
 /* So far, all bash compat is controlled by one config option */
@@ -390,6 +391,11 @@ struct forkshell {
 	char **history;
 	int cnt_history;
 #endif
+#if JOBS_WIN32
+	struct job *jobtab;
+	unsigned njobs;
+	struct job *curjob;
+#endif
 	/* struct parsefile *g_parsefile; */
 	HANDLE hMapFile;
 	char *old_base;
@@ -406,6 +412,9 @@ struct forkshell {
 	/* generic data, used by forkshell_child */
 	int mode;
 	int nprocs;
+#if JOBS_WIN32
+	int jpnull;
+#endif
 
 	/* optional data, used by forkshell_child */
 	int flags;
@@ -688,9 +697,7 @@ struct globals_misc {
 #define NTRAP_ERR  NSIG
 #define NTRAP_LAST NSIG
 
-#if !ENABLE_PLATFORM_MINGW32
 	char **trap_ptr;        /* used only by "trap hack" */
-#endif
 
 	/* Rarely referenced stuff */
 #if ENABLE_ASH_RANDOM_SUPPORT
@@ -742,9 +749,7 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 #if ENABLE_PLATFORM_MINGW32
 #undef got_sigchld
 #undef pending_sig
-#undef trap_ptr
 #define pending_sig       (0)
-#define trap_ptr          trap
 #endif
 
 #define INIT_G_misc() do { \
@@ -752,7 +757,7 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 	savestatus = -1; \
 	curdir = nullstr; \
 	physdir = nullstr; \
-	IF_NOT_PLATFORM_MINGW32(trap_ptr = trap;) \
+	trap_ptr = trap; \
 } while (0)
 
 
@@ -2990,6 +2995,33 @@ setwinxp(int on)
 		}
 	}
 }
+
+# if ENABLE_ASH_NOCONSOLE
+/*
+ * Console state is either:
+ *  0 normal
+ *  1 iconified
+ *  2 unknown
+ */
+static int console_state(void)
+{
+	DECLARE_PROC_ADDR(BOOL, ShowWindow, HWND, int);
+	DECLARE_PROC_ADDR(BOOL, IsIconic, HWND);
+
+	if (INIT_PROC_ADDR(user32.dll, ShowWindow) &&
+			INIT_PROC_ADDR(user32.dll, IsIconic)) {
+		return IsIconic(GetConsoleWindow()) != 0;
+	}
+	return 2;
+}
+
+static void hide_console(int hide)
+{
+	// Switch console state if it's known and isn't the required state
+	if (console_state() == !hide)
+		ShowWindow(GetConsoleWindow(), hide ? SW_MINIMIZE : SW_NORMAL);
+}
+# endif
 #endif
 
 
@@ -5851,7 +5883,6 @@ commandtext(union node *n)
  *
  * Called with interrupts off.
  */
-#if !ENABLE_PLATFORM_MINGW32
 /*
  * Clear traps on a fork.
  */
@@ -5875,6 +5906,7 @@ clear_traps(void)
 	INT_ON;
 }
 
+#if !ENABLE_PLATFORM_MINGW32
 /* Lives far away from here, needed for forkchild */
 static void closescript(void);
 
@@ -12612,6 +12644,9 @@ options(int *login_sh)
 #if ENABLE_PLATFORM_MINGW32
 		dirarg = NULL;
 		title = NULL;
+# if ENABLE_ASH_NOCONSOLE
+		noconsole = console_state();
+# endif
 # if ENABLE_SUW32
 		delayexit = 0;
 # endif
@@ -15797,6 +15832,23 @@ static void setvar_if_unset(const char *key, const char *value)
 }
 #endif
 
+#if ENABLE_PLATFORM_MINGW32
+static int mixed_case_special_name(const char *envp)
+{
+	const char *names = "PATH=\0""COMSPEC=\0";
+	const char *n;
+
+	for (n = names; *n; ) {
+		if (is_prefixed_with_case(envp, n) && !is_prefixed_with(envp, n)) {
+			return TRUE;
+		}
+		while (*n++)
+			;
+	}
+	return FALSE;
+}
+#endif
+
 /* Don't inline: conserve stack of caller from having our locals too */
 static NOINLINE void
 init(void)
@@ -15830,8 +15882,7 @@ init(void)
 		 * because it appears first.
 		 */
 		for (envp = environ; envp && *envp; envp++) {
-			if (is_prefixed_with_case(*envp, "PATH=") &&
-					!is_prefixed_with(*envp, "PATH=")) {
+			if (mixed_case_special_name(*envp)) {
 				break;
 			}
 		}
@@ -16447,6 +16498,9 @@ spawn_forkshell(struct forkshell *fs, struct job *jp, union node *n, int mode)
 
 	new->mode = mode;
 	new->nprocs = jp == NULL ? 0 : jp->nprocs;
+#if JOBS_WIN32
+	new->jpnull = jp == NULL;
+#endif
 	sprintf(buf, "%p", new->hMapFile);
 	argv[2] = buf;
 	ret = spawnve(P_NOWAIT, bb_busybox_exec_path, (char *const *)argv, NULL);
@@ -16730,6 +16784,90 @@ history_copy(void)
 }
 #endif
 
+#if JOBS_WIN32
+/*
+ * struct procstat
+ */
+static struct datasize
+procstat_size(struct datasize ds, int nj)
+{
+	struct job *jp = jobtab + nj;
+
+	if (jp->ps != &jp->ps0)
+		ds.funcblocksize += sizeof(struct procstat) * jp->nprocs;
+
+	for (int i = 0; i < jp->nprocs; i++)
+		ds.funcstringsize += align_len(jp->ps[i].ps_cmd);
+
+	return ds;
+}
+
+static struct procstat *
+procstat_copy(int nj)
+{
+	struct job *jp = jobtab + nj;
+	struct procstat *new = funcblock;
+
+	funcblock = (char *)funcblock + sizeof(struct procstat) * jp->nprocs;
+	memcpy(new, jp->ps, sizeof(struct procstat) * jp->nprocs);
+
+	for (int i = 0; i < jp->nprocs; i++) {
+		new[i].ps_cmd = nodeckstrdup(jp->ps[i].ps_cmd);
+		SAVE_PTR(new[i].ps_cmd,
+				xasprintf("jobtab[%d].ps[%d].ps_cmd '%s'",
+							nj, i, jp->ps[i].ps_cmd), FREE);
+	}
+	return new;
+}
+
+/*
+ * struct jobs
+ */
+static struct datasize
+jobtab_size(struct datasize ds)
+{
+	ds.funcblocksize += sizeof(struct job) * njobs;
+	for (int i = 0; i < njobs; i++) {
+		if (jobtab[i].used)
+			ds = procstat_size(ds, i);
+	}
+	return ds;
+}
+
+static struct job *
+jobtab_copy(void)
+{
+	struct job *new = funcblock;
+	int i;
+
+	funcblock = (char *)funcblock + sizeof(struct job) * njobs;
+	memcpy(new, jobtab, sizeof(struct job) * njobs);
+
+	for (i = 0; i < njobs; i++) {
+		if (!jobtab[i].used)
+			continue;
+
+		if (jobtab[i].ps == &jobtab[i].ps0) {
+			new[i].ps0.ps_cmd = nodeckstrdup(jobtab[i].ps0.ps_cmd);
+			SAVE_PTR(new[i].ps0.ps_cmd,
+					xasprintf("jobtab[%d].ps0.ps_cmd '%s'",
+								i, jobtab[i].ps0.ps_cmd), FREE);
+			new[i].ps = &new[i].ps0;
+		} else {
+			new[i].ps = procstat_copy(i);
+		}
+		SAVE_PTR(new[i].ps, xasprintf("jobtab[%d].ps", i), FREE);
+
+		if (jobtab[i].prev_job) {
+			new[i].prev_job = new + (jobtab[i].prev_job - jobtab);
+			SAVE_PTR(new[i].prev_job,
+						xasprintf("jobtab[%d].prev_job", i), FREE);
+		}
+	}
+	return new;
+}
+#endif
+
 /*
  * struct redirtab
  */
@@ -16822,6 +16960,8 @@ globals_misc_size(struct datasize ds)
 		ds.funcstringsize += align_len(physdir);
 	ds.funcstringsize += align_len(arg0);
 	ds.funcstringsize += align_len(commandname);
+	for (int i = 0; i < ARRAY_SIZE(trap); i++)
+		ds.funcstringsize += align_len(trap[i]);
 	return ds;
 }
 
@@ -16831,6 +16971,7 @@ globals_misc_size(struct datasize ds)
 #undef arg0
 #undef commandname
 #undef nullstr
+#undef trap
 static struct globals_misc *
 globals_misc_copy(void)
 {
@@ -16853,6 +16994,10 @@ globals_misc_copy(void)
 	SAVE_PTR(new->arg0, xasprintf("arg0 '%s'", p->arg0 ?: "NULL"), FREE);
 	SAVE_PTR(new->commandname,
 			xasprintf("commandname '%s'", p->commandname ?: "NULL"), FREE);
+	for (int i = 0; i < ARRAY_SIZE(p->trap); i++) {
+		new->trap[i] = nodeckstrdup(p->trap[i]);
+		SAVE_PTR(new->trap[i], xasprintf("trap[%d]", i), FREE);
+	}
 	return new;
 }
 
@@ -16872,13 +17017,17 @@ forkshell_size(struct forkshell *fs)
 	ds.funcblocksize = calcsize(ds.funcblocksize, fs->n);
 	ds = argv_size(ds, fs->argv);
 
-	if ((ENABLE_ASH_ALIAS || MAX_HISTORY) && fs->fpid != FS_SHELLEXEC) {
+	if ((ENABLE_ASH_ALIAS || MAX_HISTORY || JOBS_WIN32) &&
+				fs->fpid != FS_SHELLEXEC) {
 #if ENABLE_ASH_ALIAS
 		ds = atab_size(ds);
 #endif
 #if MAX_HISTORY
 		if (line_input_state)
 			ds = history_size(ds);
+#endif
+#if JOBS_WIN32
+		ds = jobtab_size(ds);
 #endif
 	}
 	return ds;
@@ -16906,7 +17055,8 @@ forkshell_copy(struct forkshell *fs, struct forkshell *new)
 	SAVE_PTR(new->n, "n", NO_FREE);
 	SAVE_PTR(new->argv, "argv", NO_FREE);
 
-	if ((ENABLE_ASH_ALIAS || MAX_HISTORY) && fs->fpid != FS_SHELLEXEC) {
+	if ((ENABLE_ASH_ALIAS || MAX_HISTORY || JOBS_WIN32) &&
+					fs->fpid != FS_SHELLEXEC) {
 #if ENABLE_ASH_ALIAS
 		new->atab = atab_copy();
 		SAVE_PTR(new->atab, "atab", NO_FREE);
@@ -16918,12 +17068,23 @@ forkshell_copy(struct forkshell *fs, struct forkshell *new)
 			new->cnt_history = line_input_state->cnt_history;
 		}
 #endif
+#if JOBS_WIN32
+		new->jobtab = jobtab_copy();
+		SAVE_PTR(new->jobtab, "jobtab", NO_FREE);
+		new->njobs = njobs;
+		if (curjob) {
+			new->curjob = new->jobtab + (curjob - jobtab);
+			SAVE_PTR(new->curjob, "curjob", NO_FREE);
+		}
+#endif
 	}
 }
 
 #if FORKSHELL_DEBUG
-/* fp and notes can each be NULL */
-#define NUM_BLOCKS 7
+#define NUM_BLOCKS FUNCSTRING
+enum {GVP, GMP, CMDTABLE, NODE, ARGV, ATAB, HISTORY, JOBTAB, FUNCSTRING};
+
+/* fp0 and notes can each be NULL */
 static void
 forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 {
@@ -16935,7 +17096,6 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 	int count, i, total;
 	int size[NUM_BLOCKS];
 	char *lptr[NUM_BLOCKS+1];
-	enum {GVP, GMP, CMDTABLE, NODE, ARGV, ATAB, HISTORY, FUNCSTRING};
 	const char *fsname[] = {
 		"FS_OPENHERE",
 		"FS_EVALBACKCMD",
@@ -16972,10 +17132,15 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 		/* Depending on the configuration and the type of forkshell
 		 * some items may not be present. */
 		lptr[FUNCSTRING] = lfuncstring;
-#if MAX_HISTORY
-		lptr[HISTORY] = fs->history ? (char *)fs->history : lptr[FUNCSTRING];
+#if JOBS_WIN32
+		lptr[JOBTAB] = fs->jobtab ? (char *)fs->jobtab : lptr[FUNCSTRING];
 #else
-		lptr[HISTORY] = lptr[FUNCSTRING];
+		lptr[JOBTAB] = lptr[FUNCSTRING];
+#endif
+#if MAX_HISTORY
+		lptr[HISTORY] = fs->history ? (char *)fs->history : lptr[JOBTAB];
+#else
+		lptr[HISTORY] = lptr[JOBTAB];
 #endif
 		lptr[ATAB] = IF_ASH_ALIAS(fs->atab ? (char *)fs->atab :) lptr[HISTORY];
 		lptr[ARGV] = fs->argv ? (char *)fs->argv : lptr[ATAB];
@@ -17116,7 +17281,6 @@ forkshell_prepare(struct forkshell *fs)
 	return new;
 }
 
-#undef trap
 #undef trap_ptr
 static void
 forkshell_init(const char *idstr)
@@ -17165,8 +17329,7 @@ forkshell_init(const char *idstr)
 			e = e->next;
 		}
 	}
-	memset(fs->gmp->trap, 0, sizeof(fs->gmp->trap[0])*NSIG);
-	/* fs->gmp->trap_ptr = fs->gmp->trap; */
+	fs->gmp->trap_ptr = fs->gmp->trap;
 
 	/* Set global variables */
 	gvpp = (struct globals_var **)&ash_ptr_to_globals_var;
@@ -17184,6 +17347,11 @@ forkshell_init(const char *idstr)
 		for (i = 0; i < line_input_state->cnt_history; i++)
 			line_input_state->history[i] = fs->history[i];
 	}
+#endif
+#if JOBS_WIN32
+	jobtab = fs->jobtab;
+	njobs = fs->njobs;
+	curjob = fs->curjob;
 #endif
 
 	CLEAR_RANDOM_T(&random_gen); /* or else $RANDOM repeats in child */
@@ -17208,9 +17376,32 @@ forkshell_init(const char *idstr)
 	else {
 		SetConsoleCtrlHandler(ctrl_handler, TRUE);
 	}
+
+	if (fs->n && fs->n->type == NCMD        /* is it single cmd? */
+	/* && n->ncmd.args->type == NARG - always true? */
+	 && fs->n->ncmd.args && strcmp(fs->n->ncmd.args->narg.text, "trap") == 0
+	 && fs->n->ncmd.args->narg.next == NULL /* "trap" with no arguments */
+	/* && n->ncmd.args->narg.backquote == NULL - do we need to check this? */
+	) {
+		TRACE(("Trap hack\n"));
+		/* Save trap handler strings for trap builtin to print */
+		fs->gmp->trap_ptr = xmemdup(fs->gmp->trap, sizeof(fs->gmp->trap));
+		/* Fall through into clearing traps */
+	}
+	clear_traps();
 #if JOBS_WIN32
 	/* do job control only in root shell */
 	doing_jobctl = 0;
+
+	if (fs->n && fs->n->type == NCMD && fs->n->ncmd.args &&
+			strcmp(fs->n->ncmd.args->narg.text, "jobs") == 0) {
+		TRACE(("Job hack\n"));
+		if (!fs->jpnull)
+			freejob(curjob);
+		goto end;
+	}
+	for (struct job *jp = curjob; jp; jp = jp->prev_job)
+		freejob(jp);
 #endif
  end:
 	forkshell_child(fs);
