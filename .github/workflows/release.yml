@@ -12,12 +12,12 @@ jobs:
         run: |
           cat >ci.sh<<EOF
             rm -rf \`find /etc/yum.repos.d -not -name 'fedora.repo' -not -name 'fedora-updates.repo' -not -name 'yum.repos.d'\`
-            dnf install mingw32-gcc mingw32-windows-default-manifest diffutils gcc make ncurses-devel perl-Pod-Html bzip2 -y --setopt=install_weak_deps=False --setopt=max_parallel_downloads=8 --setopt=fastestmirror=True
+            dnf install mingw64-gcc mingw64-windows-default-manifest diffutils gcc make ncurses-devel perl-Pod-Html bzip2 -y --setopt=install_weak_deps=False --setopt=max_parallel_downloads=8 --setopt=fastestmirror=True
             cd busybox-w32
-            make mingw32_defconfig
+            make mingw64_defconfig
             make -j`nproc`
           EOF
-          docker run --name hi -d fedora:37 sleep infinity
+          docker run --name hi -d fedora:39 sleep infinity
           docker cp ./ci.sh hi:/ci.sh
           docker cp . hi:/busybox-w32
           docker exec hi sh -c 'chmod +x /ci.sh ; /ci.sh'
