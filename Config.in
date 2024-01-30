@@ -432,14 +432,35 @@ config FEATURE_VERSIONINFO
 	help
 	Include version information in the application.
 
-config FEATURE_UTF8_MANIFEST
-	bool "Include UTF-8 manifest in binary"
-	default n
+choice
+	prompt "Manifest"
+	default FEATURE_APP_MANIFEST
 	depends on FEATURE_RESOURCES
 	help
+	  Manifest to include in resources.
+
+config FEATURE_TOOLCHAIN_MANIFEST
+	bool "Toolchain default"
+	help
+	Include the default application manifest provided by the build
+	toolchain, if any.  Enable this if your build toolchain includes
+	a suitable manifest.
+
+config FEATURE_APP_MANIFEST
+	bool "Application"
+	help
+	Include a manifest which declares privileges required by the
+	application and supported versions of Windows.
+
+config FEATURE_UTF8_MANIFEST
+	bool "UTF-8"
+	help
 	Include a manifest which sets the process code page to UTF-8.
+	This also includes details from the standard application manifest.
 	Users who enable this may also wish to enable FEATURE_UTF8_INPUT
 	and/or FEATURE_UTF8_OUTPUT.
+
+endchoice
 
 config FEATURE_ICON
 	bool "Include application icon in binary"
@@ -534,6 +555,16 @@ config FEATURE_EXTRA_FILE_DATA
 	onto itself or to store a tar archive in itself.  Also try to
 	determine the ownership of files so that, for example, 'ls' can
 	distinguish files belonging to the current user.
+
+config OVERRIDE_APPLETS
+	string "Override applets"
+	default ""
+	depends on PLATFORM_MINGW32 && (FEATURE_PREFER_APPLETS || FEATURE_SH_STANDALONE)
+	help
+	A list of applets to be ignored in standalone shell mode.  The
+	format is the same as that used by the BB_OVERRIDE_APPLETS
+	environment variable.  BB_OVERRIDE_APPLETS is checked first, if it
+	allows the applet and this list is non-empty it is checked too.
 
 comment 'Build Options'
 
@@ -657,6 +688,18 @@ config CROSS_COMPILER_PREFIX
 	"make CROSS_COMPILE=xxx ..." will override this selection.
 
 	Native builds leave this empty.
+
+config HOST_COMPILER
+	string "Host compiler"
+	default "gcc"
+	help
+	Name of the compiler to use for host binaries.
+
+config CROSS_COMPILER
+	string "Cross compiler"
+	default "gcc"
+	help
+	Name of the compiler to use for cross compilation.
 
 config SYSROOT
 	string "Path to sysroot"

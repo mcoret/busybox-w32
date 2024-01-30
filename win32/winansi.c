@@ -123,6 +123,8 @@ int terminal_mode(int reset)
 			if (GetConsoleMode(h, &oldmode)) {
 				// Try to recover from mode 0 induced by SSH.
 				newmode = oldmode == 0 ? 3 : oldmode;
+				// Turn off DISABLE_NEWLINE_AUTO_RETURN induced by Gradle?
+				newmode &= ~DISABLE_NEWLINE_AUTO_RETURN;
 
 				if ((mode & VT_OUTPUT)) {
 					newmode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
@@ -516,7 +518,7 @@ static char *process_colour(char *str, WORD *attr)
 {
 	long val = strtol(str, (char **)&str, 10);
 
-	*attr = -1;	/* error return */
+	*attr = 0xffff;	/* error return */
 	switch (val) {
 	case 2:
 		str = process_24bit(str + 1, attr);
@@ -626,7 +628,7 @@ static char *process_escape(char *pos)
 				break;
 			case 38: /* 8/24 bit */
 				str = process_colour(str + 1, &t);
-				if (t != -1) {
+				if (t != 0xffff) {
 					attr &= ~(FOREGROUND_ALL|FOREGROUND_INTENSITY);
 					attr |= t;
 				}
@@ -650,7 +652,7 @@ static char *process_escape(char *pos)
 				break;
 			case 48: /* 8/24 bit */
 				str = process_colour(str + 1, &t);
-				if (t != -1) {
+				if (t != 0xffff) {
 					attr &= ~(BACKGROUND_ALL|BACKGROUND_INTENSITY);
 					attr |= t << 4;
 				}
@@ -1276,7 +1278,7 @@ static void maybeEatUpto2ndHalfUp(HANDLE h, DWORD *ph1)
 
 		// got 2nd-half-up. eat the events up to this, combine the values
 		ReadConsoleInputW(h, r, i, &got);
-		*ph1 = 0x10000 | ((*ph1 & ~0xD800) << 10) | (h2 & ~0xDC00);
+		*ph1 = 0x10000 + (((*ph1 & ~0xD800) << 10) | (h2 & ~0xDC00));
 		return;
 	}
 }

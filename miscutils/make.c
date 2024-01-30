@@ -293,6 +293,19 @@ vwarning(FILE *stream, const char *msg, va_list list)
 }
 
 /*
+ * Diagnostic handler.  Print message to standard error.
+ */
+static void
+diagnostic(const char *msg, ...)
+{
+	va_list list;
+
+	va_start(list, msg);
+	vwarning(stderr, msg, list);
+	va_end(list);
+}
+
+/*
  * Error handler.  Print message and exit.
  */
 static void error(const char *msg, ...) NORETURN;
@@ -425,14 +438,22 @@ check_name(const char *name)
 {
 	const char *s;
 
-	if (!posix)
+#if ENABLE_PLATFORM_MINGW32
+	if (!posix || (pragma & P_WINDOWS)) {
+		if (isalpha(name[0]) && name[1] == ':' && name[2] == '/') {
+			name += 3;
+		}
+	}
+#endif
+	if (!posix) {
+		for (s = name; *s; ++s) {
+			if (*s == '=')
+				return FALSE;
+		}
 		return TRUE;
+	}
 
 	for (s = name; *s; ++s) {
-#if ENABLE_PLATFORM_MINGW32
-		if ((pragma & P_WINDOWS) && *s == ':')
-			continue;
-#endif
 		if ((pragma & P_TARGET_NAME) || !POSIX_2017 ?
 				!(isfname(*s) || *s == '/') : !ispname(*s))
 			return FALSE;
@@ -1144,6 +1165,40 @@ modify_words(const char *val, int modifier, size_t lenf, size_t lenr,
 }
 
 /*
+ * Try to detect a target rule by searching for a colon that isn't part
+ * of a macro assignment.  Macros must have been expanded already.  Return
+ * a pointer to the colon or NULL.
+ */
+static char *
+find_colon(char *p)
+{
+	char *q;
+
+#if ENABLE_PLATFORM_MINGW32
+	for (q = p; (q = strchr(q, ':')); ++q) {
+		if (posix && !(pragma & P_WINDOWS))
+			break;
+		if (q == p || !isalpha(q[-1]) || q[1] != '/')
+			break;
+	}
+	if (q != NULL) {
+#else
+	if ((q = strchr(p, ':')) != NULL) {
+#endif
+		// Skip ':=', '::=' and ':::=' macro assignments
+		if (
+			// '::=' and ':::=' are from POSIX 202X.
+			!(!POSIX_2017 && q[1] == ':' && q[2] == ':' && q[3] == '=') &&
+			!(!POSIX_2017 && q[1] == ':' && q[2] == '=') &&
+			// ':=' is a non-POSIX extension
+			!(!posix && q[1] == '=')
+			)
+			return q;
+	}
+	return NULL;
+}
+
+/*
  * Return a pointer to the next instance of a given character.  Macro
  * expansions are skipped so the ':' and '=' in $(VAR:.s1=.s2) aren't
  * detected as separators for rules or macro definitions.
@@ -1159,29 +1214,6 @@ find_char(const char *str, int c)
 	}
 	return NULL;
 }
-
-#if ENABLE_PLATFORM_MINGW32
-/*
- * Ignore colons in targets of the form c:/path when looking for a
- * target rule.
- */
-static char *
-find_colon(const char *str)
-{
-	const char *s = str;
-
-	while ((s = find_char(s, ':'))) {
-		if (posix && !(pragma & P_WINDOWS))
-			break;
-		if (s[1] != '/')
-			break;
-		++s;
-	}
-	return (char *)s;
-}
-#else
-# define find_colon(s) find_char(s, ':')
-#endif
 
 /*
  * Recursively expand any macros in str to an allocated string.
@@ -1868,7 +1900,147 @@ input(FILE *fd, int ilevel)
 			goto end_loop;
 		}
 
-		// Check for a macro definition
+		// Check for target rule
+		a = p = expanded = expand_macros(str, FALSE);
+		if ((q = find_colon(p)) != NULL) {
+			// All tokens before ':' must be valid targets
+			*q = '\0';
+			while ((a = gettok(&p)) != NULL && is_valid_target(a))
+				;
+		}
+		free(expanded);
+
+		if (a == NULL) {
+			// Looks like a target rule
+			p = expanded = expand_macros(str, FALSE);
+
+			// Look for colon separator
+			q = find_colon(p);
+			if (q == NULL)
+				error("expected separator");
+
+			*q++ = '\0';	// Separate targets and prerequisites
+
+			// Double colon
+			dbl = !posix && *q == ':';
+			if (dbl)
+				q++;
+
+			// Look for semicolon separator
+			cp = NULL;
+			s = strchr(q, ';');
+			if (s) {
+				*s = '\0';
+				// Retrieve command from copy of line
+				if ((p = find_char(copy, ':')) && (p = strchr(p, ';')))
+					newcmd(&cp, process_command(p + 1));
+			}
+			semicolon_cmd = cp != NULL;
+
+			// Create list of prerequisites
+			dp = NULL;
+			while (((p = gettok(&q)) != NULL)) {
+				char *newp = NULL;
+
+				if (!posix) {
+					// Allow prerequisites of form library(member1 member2).
+					// Leading and trailing spaces in the brackets are skipped.
+					if (!lib) {
+						s = strchr(p, '(');
+						if (s && !ends_with_bracket(s) && strchr(q, ')')) {
+							// Looks like an unterminated archive member
+							// with a terminator later on the line.
+							lib = p;
+							if (s[1] != '\0') {
+								p = newp = auto_concat(lib, ")");
+								s[1] = '\0';
+							} else {
+								continue;
+							}
+						}
+					} else if (ends_with_bracket(p)) {
+						if (*p != ')')
+							p = newp = auto_concat(lib, p);
+						lib = NULL;
+						if (newp == NULL)
+							continue;
+					} else {
+						p = newp = auto_string(xasprintf("%s%s)", lib, p));
+					}
+				}
+
+				// If not in POSIX mode expand wildcards in the name.
+				nfile = 1;
+				files = &p;
+				if (!posix && wildcard(p, &gd)) {
+					nfile = gd.gl_pathc;
+					files = gd.gl_pathv;
+				}
+				for (i = 0; i < nfile; ++i) {
+					if (!POSIX_2017 && strcmp(files[i], ".WAIT") == 0)
+						continue;
+					np = newname(files[i]);
+					newdep(&dp, np);
+				}
+				if (files != &p)
+					globfree(&gd);
+				free(newp);
+			}
+			lib = NULL;
+
+			// Create list of commands
+			startno = dispno;
+			while ((str2 = readline(fd)) && *str2 == '\t') {
+				newcmd(&cp, process_command(str2));
+				free(str2);
+			}
+			dispno = startno;
+
+			// Create target names and attach rule to them
+			q = expanded;
+			count = 0;
+			seen_inference = FALSE;
+			while ((p = gettok(&q)) != NULL) {
+				// If not in POSIX mode expand wildcards in the name.
+				nfile = 1;
+				files = &p;
+				if (!posix && wildcard(p, &gd)) {
+					nfile = gd.gl_pathc;
+					files = gd.gl_pathv;
+				}
+				for (i = 0; i < nfile; ++i) {
+					int ttype = target_type(files[i]);
+
+					np = newname(files[i]);
+					if (ttype != T_NORMAL) {
+						if (ttype == T_INFERENCE && posix) {
+							if (semicolon_cmd)
+								error_in_inference_rule("'; command'");
+							seen_inference = TRUE;
+						}
+						np->n_flag |= N_SPECIAL;
+					} else if (!firstname) {
+						firstname = np;
+					}
+					addrule(np, dp, cp, dbl);
+					count++;
+				}
+				if (files != &p)
+					globfree(&gd);
+			}
+			if (seen_inference && count != 1)
+				error_in_inference_rule("multiple targets");
+
+			// Prerequisites and commands will be unused if there were
+			// no targets.  Avoid leaking memory.
+			if (count == 0) {
+				freedeps(dp);
+				freecmds(cp);
+			}
+			goto end_loop;
+		}
+
+		// If we get here it must be a macro definition
 		q = find_char(str, '=');
 		if (q != NULL) {
 			int level = (useenv || fd == NULL) ? 4 : 3;
@@ -1953,135 +2125,10 @@ input(FILE *fd, int ilevel)
 			}
 			setmacro(a, q, level);
 			free(newq);
-			goto end_loop;
+		} else {
+			error("missing separator");
 		}
 
-		// If we get here it must be a target rule
-		p = expanded = expand_macros(str, FALSE);
-
-		// Look for colon separator
-		q = find_colon(p);
-		if (q == NULL)
-			error("expected separator");
-
-		*q++ = '\0';	// Separate targets and prerequisites
-
-		// Double colon
-		dbl = !posix && *q == ':';
-		if (dbl)
-			q++;
-
-		// Look for semicolon separator
-		cp = NULL;
-		s = strchr(q, ';');
-		if (s) {
-			*s = '\0';
-			// Retrieve command from copy of line
-			if ((p = find_colon(copy)) && (p = strchr(p, ';')))
-				newcmd(&cp, process_command(p + 1));
-		}
-		semicolon_cmd = cp != NULL;
-
-		// Create list of prerequisites
-		dp = NULL;
-		while (((p = gettok(&q)) != NULL)) {
-			char *newp = NULL;
-
-			if (!posix) {
-				// Allow prerequisites of form library(member1 member2).
-				// Leading and trailing spaces in the brackets are skipped.
-				if (!lib) {
-					s = strchr(p, '(');
-					if (s && !ends_with_bracket(s) && strchr(q, ')')) {
-						// Looks like an unterminated archive member
-						// with a terminator later on the line.
-						lib = p;
-						if (s[1] != '\0') {
-							p = newp = auto_concat(lib, ")");
-							s[1] = '\0';
-						} else {
-							continue;
-						}
-					}
-				} else if (ends_with_bracket(p)) {
-					if (*p != ')')
-						p = newp = auto_concat(lib, p);
-					lib = NULL;
-					if (newp == NULL)
-						continue;
-				} else {
-					p = newp = auto_string(xasprintf("%s%s)", lib, p));
-				}
-			}
-
-			// If not in POSIX mode expand wildcards in the name.
-			nfile = 1;
-			files = &p;
-			if (!posix && wildcard(p, &gd)) {
-				nfile = gd.gl_pathc;
-				files = gd.gl_pathv;
-			}
-			for (i = 0; i < nfile; ++i) {
-				if (!POSIX_2017 && strcmp(files[i], ".WAIT") == 0)
-					continue;
-				np = newname(files[i]);
-				newdep(&dp, np);
-			}
-			if (files != &p)
-				globfree(&gd);
-			free(newp);
-		}
-		lib = NULL;
-
-		// Create list of commands
-		startno = dispno;
-		while ((str2 = readline(fd)) && *str2 == '\t') {
-			newcmd(&cp, process_command(str2));
-			free(str2);
-		}
-		dispno = startno;
-
-		// Create target names and attach rule to them
-		q = expanded;
-		count = 0;
-		seen_inference = FALSE;
-		while ((p = gettok(&q)) != NULL) {
-			// If not in POSIX mode expand wildcards in the name.
-			nfile = 1;
-			files = &p;
-			if (!posix && wildcard(p, &gd)) {
-				nfile = gd.gl_pathc;
-				files = gd.gl_pathv;
-			}
-			for (i = 0; i < nfile; ++i) {
-				int ttype = target_type(files[i]);
-
-				np = newname(files[i]);
-				if (ttype != T_NORMAL) {
-					if (ttype == T_INFERENCE && posix) {
-						if (semicolon_cmd)
-							error_in_inference_rule("'; command'");
-						seen_inference = TRUE;
-					}
-					np->n_flag |= N_SPECIAL;
-				} else if (!firstname) {
-					firstname = np;
-				}
-				addrule(np, dp, cp, dbl);
-				count++;
-			}
-			if (files != &p)
-				globfree(&gd);
-		}
-		if (seen_inference && count != 1)
-			error_in_inference_rule("multiple targets");
-
-		// Prerequisites and commands will be unused if there were
-		// no targets.  Avoid leaking memory.
-		if (count == 0) {
-			freedeps(dp);
-			freecmds(cp);
-		}
  end_loop:
 		free(str1);
 		dispno = lineno;
@@ -2111,7 +2158,7 @@ remove_target(void)
 	if (!dryrun && !print && !precious &&
 			target && !(target->n_flag & (N_PRECIOUS | N_PHONY)) &&
 			unlink(target->n_name) == 0) {
-		warning("'%s' removed", target->n_name);
+		diagnostic("'%s' removed", target->n_name);
 	}
 }
 
@@ -2154,8 +2201,10 @@ docmds(struct name *np, struct cmd *cp)
 		} else if (!sdomake)
 			ssilent = dotouch;
 
-		if (!ssilent)
+		if (!ssilent) {
 			puts(q);
+			fflush_all();
+		}
 
 		if (sdomake) {
 			// Get the shell to execute it
@@ -2164,26 +2213,44 @@ docmds(struct name *np, struct cmd *cp)
 
 			target = np;
 			status = system(cmd);
-			target = NULL;
-			estat = MAKE_DIDSOMETHING;
 			// If this command was being run to create an include file
 			// or bring it up-to-date errors should be ignored and a
 			// failure status returned.
 			if (status == -1 && !doinclude) {
 				error("couldn't execute '%s'", q);
 			} else if (status != 0 && !signore) {
-				if (!doinclude)
-					warning("failed to build '%s'", np->n_name);
-#if !ENABLE_PLATFORM_MINGW32
-				if (status == SIGINT || status == SIGQUIT)
-#endif
+				if (!posix && WIFSIGNALED(status))
 					remove_target();
-				if (errcont || doinclude)
+				if (errcont) {
+					diagnostic("failed to build '%s'", np->n_name);
 					estat |= MAKE_FAILURE;
-				else
-					exit(status);
+					free(command);
+					free(cmd);
+					break;
+				} else if (doinclude) {
+					warning("failed to build '%s'", np->n_name);
+				} else {
+					const char *err_type = NULL;
+					int err_value;
+
+					if (WIFEXITED(status)) {
+						err_type = "exit";
+						err_value = WEXITSTATUS(status);
+					} else if (WIFSIGNALED(status)) {
+						err_type = "signal";
+						err_value = WTERMSIG(status);
+					}
+
+					if (err_type)
+						error("failed to build '%s' %s %d", np->n_name,
+								err_type, err_value);
+					else
+						error("failed to build '%s'", np->n_name);
+				}
 			}
 		}
+		if (sdomake || dryrun || dotouch)
+			estat = MAKE_DIDSOMETHING;
 		free(command);
 	}
 	makefile = NULL;
@@ -2426,7 +2493,7 @@ make(struct name *np, int level)
 			else if (!doinclude && level == 0 && !(estat & MAKE_DIDSOMETHING))
 				warning("nothing to be done for %s", np->n_name);
 		} else if (!doinclude) {
-			warning("'%s' not built due to errors", np->n_name);
+			diagnostic("'%s' not built due to errors", np->n_name);
 		}
 		free(oodate);
 	}
@@ -2794,7 +2861,10 @@ int make_main(int argc UNUSED_PARAM, char **argv)
 			path = newpath = xmalloc_realpath(p);
 			free(p);
 			if (!path) {
-				bb_perror_msg("can't resolve path for %s", argv[0]);
+				if (unix_path(argv[0]))
+					path = argv[0];
+				else
+					bb_perror_msg("can't resolve path for %s", argv[0]);
 			}
 		}
 #else

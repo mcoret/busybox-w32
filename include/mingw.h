@@ -136,7 +136,8 @@ int mingw_rename(const char*, const char*);
 #define rename mingw_rename
 
 FILE *mingw_popen(const char *cmd, const char *mode);
-int mingw_popen_fd(const char *cmd, const char *mode, int fd0, pid_t *pid);
+int mingw_popen_fd(const char *exe, const char *cmd, const char *mode,
+					int fd0, pid_t *pid);
 int mingw_pclose(FILE *fd);
 pid_t mingw_fork_compressor(int fd, const char *compressor, const char *mode);
 #undef popen
@@ -228,13 +229,18 @@ int unsetenv(const char *env);
 char *strndup(char const *s, size_t n);
 char *mingw_strerror(int errnum);
 char *strsignal(int sig);
+int strverscmp(const char *s1, const char *s2);
 
 #define strerror mingw_strerror
 
 /*
  * strings.h
  */
+#if !defined(__clang__)
 int ffs(int i);
+#else
+# define ffs(i) __builtin_ffs(i)
+#endif
 
 /*
  * sys/ioctl.h
@@ -547,21 +553,25 @@ int utimes(const char *file_name, const struct timeval times[2]);
 
 char ** FAST_FUNC grow_argv(char **argv, int n);
 pid_t FAST_FUNC mingw_spawn(char **argv);
-pid_t FAST_FUNC mingw_spawn_detach(char **argv);
+intptr_t FAST_FUNC mingw_spawn_detach(char **argv);
 intptr_t FAST_FUNC mingw_spawn_proc(const char **argv);
 int mingw_execv(const char *cmd, char *const *argv);
+int httpd_execv_detach(const char *cmd, char *const *argv);
 int mingw_execvp(const char *cmd, char *const *argv);
 int mingw_execve(const char *cmd, char *const *argv, char *const *envp);
 #define spawn mingw_spawn
 #define execvp mingw_execvp
 #define execve mingw_execve
 #define execv mingw_execv
+#define HTTPD_DETACH (8)
 
 #define has_dos_drive_prefix(path) (isalpha(*(path)) && (path)[1] == ':')
 
 BOOL WINAPI kill_child_ctrl_handler(DWORD dwCtrlType);
 int kill_signal_by_handle(HANDLE process, int sig);
 int FAST_FUNC is_valid_signal(int number);
+int exit_code_to_wait_status(DWORD win_exit_code);
+int exit_code_to_posix(DWORD win_exit_code);
 
 #define find_mount_point(n, s) find_mount_point(n)
 

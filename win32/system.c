@@ -18,5 +18,5 @@ int mingw_system(const char *cmd)
 	GetExitCodeProcess(h, &ret);
 	CloseHandle(h);
 
-	return ret << 8;
+	return exit_code_to_wait_status(ret);
 }

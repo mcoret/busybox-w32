@@ -45,7 +45,7 @@ pid_t mingw_wait3(pid_t pid, int *status, int options, struct rusage *rusage)
 			}
 #endif
 			CloseHandle(proc);
-			*status = code << 8;
+			*status = exit_code_to_wait_status(code);
 			return pid;
 		}
 	}
@@ -248,6 +248,56 @@ grow_argv(char **argv, int n)
 	return new_argv;
 }
 
+#if ENABLE_FEATURE_HTTPD_CGI
+static int
+create_detached_process(const char *prog, char *const *argv)
+{
+	int argc, i;
+	char *command = NULL;
+	STARTUPINFO siStartInfo;
+	PROCESS_INFORMATION piProcInfo;
+	int success;
+
+	argc = string_array_len((char **)argv);
+	for (i = 0; i < argc; i++) {
+		char *qarg = quote_arg(argv[i]);
+		command = xappendword(command, qarg);
+		if (ENABLE_FEATURE_CLEAN_UP)
+			free(qarg);
+	}
+
+	ZeroMemory(&siStartInfo, sizeof(STARTUPINFO));
+	siStartInfo.cb = sizeof(STARTUPINFO);
+	siStartInfo.hStdInput = (HANDLE)_get_osfhandle(STDIN_FILENO);
+	siStartInfo.hStdOutput = (HANDLE)_get_osfhandle(STDOUT_FILENO);
+	siStartInfo.dwFlags = STARTF_USESTDHANDLES;
+
+	success = CreateProcess((LPCSTR)prog,
+				(LPSTR)command,    /* command line */
+				NULL,              /* process security attributes */
+				NULL,              /* primary thread security attributes */
+				TRUE,              /* handles are inherited */
+				DETACHED_PROCESS,  /* creation flags */
+				NULL,              /* use parent's environment */
+				NULL,              /* use parent's current directory */
+				&siStartInfo,      /* STARTUPINFO pointer */
+				&piProcInfo);      /* receives PROCESS_INFORMATION */
+
+	if (ENABLE_FEATURE_CLEAN_UP)
+		free(command);
+
+	if (!success)
+		return -1;
+	exit(0);
+}
+
+# define SPAWNVEQ(m, p, a, e) \
+	((m != HTTPD_DETACH) ? spawnveq(m, p, a, e) : \
+		create_detached_process(p, a))
+#else
+# define SPAWNVEQ(m, p, a, e) spawnveq(m, p, a, e)
+#endif
+
 static intptr_t
 mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 			char *const *envp, int level)
@@ -259,7 +309,7 @@ mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 	char *path = NULL;
 
 	if (!parse_interpreter(prog, &interp))
-		return spawnveq(mode, prog, argv, envp);
+		return SPAWNVEQ(mode, prog, argv, envp);
 
 	if (++level > 4) {
 		errno = ELOOP;
@@ -275,7 +325,7 @@ mingw_spawn_interpreter(int mode, const char *prog, char *const *argv,
 	if (unix_path(interp.path) && find_applet_by_name(interp.name) >= 0) {
 		/* the fake path indicates the index of the script */
 		new_argv[0] = path = xasprintf("%d:/%s", nopts+1, interp.name);
-		ret = mingw_spawn_applet(mode, new_argv, envp);
+		ret = SPAWNVEQ(mode, bb_busybox_exec_path, new_argv, envp);
 		goto done;
 	}
 #endif
@@ -333,26 +383,20 @@ mingw_spawnvp(int mode, const char *cmd, char *const *argv)
 	return -1;
 }
 
-static pid_t
-mingw_spawn_pid(int mode, char **argv)
+pid_t FAST_FUNC
+mingw_spawn(char **argv)
 {
 	intptr_t ret;
 
-	ret = mingw_spawnvp(mode, argv[0], (char *const *)argv);
+	ret = mingw_spawnvp(P_NOWAIT, argv[0], (char *const *)argv);
 
 	return ret == -1 ? (pid_t)-1 : (pid_t)GetProcessId((HANDLE)ret);
 }
 
-pid_t FAST_FUNC
-mingw_spawn(char **argv)
-{
-	return mingw_spawn_pid(P_NOWAIT, argv);
-}
-
-pid_t FAST_FUNC
+intptr_t FAST_FUNC
 mingw_spawn_detach(char **argv)
 {
-	return mingw_spawn_pid(P_DETACH, argv);
+	return mingw_spawnvp(P_DETACH, argv[0], argv);
 }
 
 intptr_t FAST_FUNC
@@ -407,14 +451,14 @@ static NORETURN void wait_for_child(HANDLE child)
 	SetConsoleCtrlHandler(kill_child_ctrl_handler, TRUE);
 	WaitForSingleObject(child, INFINITE);
 	GetExitCodeProcess(child, &code);
-	exit((int)code);
+	exit(exit_code_to_posix(code));
 }
 
 int
 mingw_execvp(const char *cmd, char *const *argv)
 {
 	intptr_t ret = mingw_spawnvp(P_NOWAIT, cmd, argv);
-	if (ret != -1 || errno == 0)
+	if (ret != -1)
 		wait_for_child((HANDLE)ret);
 	return ret;
 }
@@ -423,7 +467,7 @@ int
 mingw_execve(const char *cmd, char *const *argv, char *const *envp)
 {
 	intptr_t ret = mingw_spawn_interpreter(P_NOWAIT, cmd, argv, envp, 0);
-	if (ret != -1 || errno == 0)
+	if (ret != -1)
 		wait_for_child((HANDLE)ret);
 	return ret;
 }
@@ -433,6 +477,17 @@ mingw_execv(const char *cmd, char *const *argv)
 {
 	return mingw_execve(cmd, argv, NULL);
 }
+
+#if ENABLE_FEATURE_HTTPD_CGI
+int httpd_execv_detach(const char *script, char *const *argv)
+{
+	intptr_t ret = mingw_spawn_interpreter(HTTPD_DETACH, script,
+							(char *const *)argv, NULL, 0);
+	if (ret != -1)
+		exit(0);
+	return ret;
+}
+#endif
 
 static inline long long filetime_to_ticks(const FILETIME *ft)
 {
@@ -601,7 +656,7 @@ UNUSED_PARAM
 	sp->pid = pe.th32ProcessID;
 	sp->ppid = pe.th32ParentProcessID;
 
-	if (sp->pid == GetProcessId(GetCurrentProcess())) {
+	if (sp->pid == getpid()) {
 		comm = applet_name;
 	}
 	else if ((name=get_bb_string(sp->pid, pe.szExeFile, bb_comm)) != NULL) {
@@ -620,7 +675,7 @@ void FAST_FUNC read_cmdline(char *buf, int col, unsigned pid, const char *comm)
 	const char *str, *cmdline;
 
 	*buf = '\0';
-	if (pid == GetProcessId(GetCurrentProcess()))
+	if (pid == getpid())
 		cmdline = bb_command_line;
 	else if ((str=get_bb_string(pid, NULL, bb_command_line)) != NULL)
 		cmdline = str;
@@ -805,6 +860,39 @@ static int kill_SIGKILL(pid_t pid, int sig)
 int FAST_FUNC is_valid_signal(int number)
 {
 	return isalpha(*get_signame(number));
+}
+
+int exit_code_to_wait_status(DWORD exit_code)
+{
+	int sig, status;
+
+	if (exit_code == 0xc0000005)
+		return SIGSEGV;
+	else if (exit_code == 0xc000013a)
+		return SIGINT;
+
+	// When a process is terminated as if by a signal the Windows
+	// exit code is zero apart from the signal in its topmost byte.
+	// This is a busybox-w32 convention.
+	sig = exit_code >> 24;
+	if (sig != 0 && exit_code == sig << 24 && is_valid_signal(sig))
+		return sig;
+
+	// Use least significant byte as exit code, but not if it's zero
+	// and the Windows exit code as a whole is non-zero.
+	status = exit_code & 0xff;
+	if (exit_code != 0 && status == 0)
+		status = 255;
+	return status << 8;
+}
+
+int exit_code_to_posix(DWORD exit_code)
+{
+	int status = exit_code_to_wait_status(exit_code);
+
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return WEXITSTATUS(status);
 }
 
 int kill(pid_t pid, int sig)

@@ -288,7 +288,8 @@ PUSH_AND_SET_FUNCTION_VISIBILITY_TO_HIDDEN
 	: ((T)1 << (sizeof(T)*8-1)) \
 	)
 
-#if ENABLE_PLATFORM_MINGW32 && \
+// UCRT supports both "ll" and "I64", but gcc warns on "I64" with UCRT mingw
+#if ENABLE_PLATFORM_MINGW32 && !defined(_UCRT) && \
 	(!defined(__USE_MINGW_ANSI_STDIO) || !__USE_MINGW_ANSI_STDIO)
 #define LL_FMT "I64"
 #else
@@ -296,7 +297,7 @@ PUSH_AND_SET_FUNCTION_VISIBILITY_TO_HIDDEN
 #endif
 
 #if ENABLE_PLATFORM_MINGW32 && defined(_WIN64)
-#define PID_FMT "I64"
+#define PID_FMT LL_FMT
 #else
 #define PID_FMT
 #endif
@@ -588,6 +589,7 @@ char *bb_get_last_path_component_nostrip(const char *path) FAST_FUNC;
 const char *bb_basename(const char *name) FAST_FUNC;
 /* NB: can violate const-ness (similarly to strchr) */
 char *last_char_is(const char *s, int c) FAST_FUNC;
+char *last_char_is_dir_sep(const char *s) FAST_FUNC;
 const char* endofname(const char *name) FAST_FUNC;
 char *is_prefixed_with(const char *string, const char *key) FAST_FUNC;
 char *is_suffixed_with(const char *string, const char *key) FAST_FUNC;
@@ -978,7 +980,7 @@ int bb_putchar(int ch) FAST_FUNC;
 /* Note: does not use stdio, writes to fd 2 directly */
 int bb_putchar_stderr(char ch) FAST_FUNC;
 int fputs_stdout(const char *s) FAST_FUNC;
-char *xasprintf(const char *format, ...) __attribute__ ((format(printf, 1, 2))) FAST_FUNC RETURNS_MALLOC;
+char *xasprintf(const char *format, ...) __attribute__ ((format(printf, 1, 2))) RETURNS_MALLOC;
 char *auto_string(char *str) FAST_FUNC;
 // gcc-4.1.1 still isn't good enough at optimizing it
 // (+200 bytes compared to macro)
@@ -1326,13 +1328,14 @@ void run_noexec_applet_and_exit(int a, const char *name, char **argv) NORETURN F
 #ifndef BUILD_INDIVIDUAL
 int find_applet_by_name(const char *name) FAST_FUNC;
 void run_applet_no_and_exit(int a, const char *name, char **argv) NORETURN FAST_FUNC;
-# if ENABLE_PLATFORM_MINGW32 && \
-		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
-int is_applet_preferred(const char *name) FAST_FUNC;
-const char *get_ash_path(void);
+# if ENABLE_PLATFORM_MINGW32
+#  if ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE
+int is_applet_preferred(const char *name, const char *path) FAST_FUNC;
+int find_applet_by_name_with_path(const char *name, const char *path) FAST_FUNC;
+#  endif
 # else
-#  define is_applet_preferred(n) (1)
-#  define get_ash_path() (NULL)
+#  define is_applet_preferred(n, p) (1)
+#  define find_applet_by_name_with_path(n, p) find_applet_by_name(n)
 # endif
 #endif
 void show_usage_if_dash_dash_help(int applet_no, char **argv) FAST_FUNC;
@@ -1373,10 +1376,12 @@ void _exit_FAILURE(void) NORETURN FAST_FUNC;
  */
 enum {
 	DAEMON_CHDIR_ROOT      = 1 << 0,
-	DAEMON_DEVNULL_STDIO   = 1 << 1,
-	DAEMON_CLOSE_EXTRA_FDS = 1 << 2,
-	DAEMON_ONLY_SANITIZE   = 1 << 3, /* internal use */
-	//DAEMON_DOUBLE_FORK     = 1 << 4, /* double fork to avoid controlling tty */
+	DAEMON_DEVNULL_STDIN   = 1 << 1,
+	DAEMON_DEVNULL_OUTERR  = 2 << 1,
+	DAEMON_DEVNULL_STDIO   = 3 << 1,
+	DAEMON_CLOSE_EXTRA_FDS = 1 << 3,
+	DAEMON_ONLY_SANITIZE   = 1 << 4, /* internal use */
+	//DAEMON_DOUBLE_FORK     = 1 << 5, /* double fork to avoid controlling tty */
 };
 #if BB_MMU
   enum { re_execed = 0 };
@@ -1399,6 +1404,7 @@ enum {
 # define bb_daemonize(a) BUG_bb_daemonize_is_unavailable_on_nommu()
 #endif
 void bb_daemonize_or_rexec(int flags, char **argv) FAST_FUNC;
+/* Unlike bb_daemonize_or_rexec, these two helpers do not setsid: */
 void bb_sanitize_stdio(void) FAST_FUNC;
 #define bb_daemon_helper(arg) bb_daemonize_or_rexec((arg) | DAEMON_ONLY_SANITIZE, NULL)
 /* Clear dangerous stuff, set PATH. Return 1 if was run by different user. */
@@ -1408,14 +1414,15 @@ int sanitize_env_if_suid(void) FAST_FUNC;
 /* For top, ps. Some argv[i] are replaced by malloced "-opt" strings */
 void make_all_argv_opts(char **argv) FAST_FUNC;
 char* single_argv(char **argv) FAST_FUNC;
+char **skip_dash_dash(char **argv) FAST_FUNC;
 extern const char *const bb_argv_dash[]; /* { "-", NULL } */
 extern uint32_t option_mask32;
-uint32_t getopt32(char **argv, const char *applet_opts, ...) FAST_FUNC;
+uint32_t getopt32(char **argv, const char *applet_opts, ...);
 # define No_argument "\0"
 # define Required_argument "\001"
 # define Optional_argument "\002"
 #if ENABLE_LONG_OPTS
-uint32_t getopt32long(char **argv, const char *optstring, const char *longopts, ...) FAST_FUNC;
+uint32_t getopt32long(char **argv, const char *optstring, const char *longopts, ...);
 #else
 #define getopt32long(argv,optstring,longopts,...) \
 	getopt32(argv,optstring,##__VA_ARGS__)
@@ -1490,17 +1497,17 @@ extern uint8_t xfunc_error_retval;
 extern void (*die_func)(void);
 void xfunc_die(void) NORETURN FAST_FUNC;
 void bb_show_usage(void) NORETURN FAST_FUNC;
-void bb_error_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
+void bb_error_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2)));
 void bb_simple_error_msg(const char *s) FAST_FUNC;
-void bb_error_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2))) FAST_FUNC;
+void bb_error_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2)));
 void bb_simple_error_msg_and_die(const char *s) NORETURN FAST_FUNC;
-void bb_perror_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
+void bb_perror_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2)));
 void bb_simple_perror_msg(const char *s) FAST_FUNC;
-void bb_perror_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2))) FAST_FUNC;
+void bb_perror_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2)));
 void bb_simple_perror_msg_and_die(const char *s) NORETURN FAST_FUNC;
-void bb_herror_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
+void bb_herror_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2)));
 void bb_simple_herror_msg(const char *s) FAST_FUNC;
-void bb_herror_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2))) FAST_FUNC;
+void bb_herror_msg_and_die(const char *s, ...) __attribute__ ((noreturn, format (printf, 1, 2)));
 void bb_simple_herror_msg_and_die(const char *s) NORETURN FAST_FUNC;
 void bb_perror_nomsg_and_die(void) NORETURN FAST_FUNC;
 void bb_perror_nomsg(void) FAST_FUNC;
@@ -1516,7 +1523,7 @@ void bb_logenv_override(void) FAST_FUNC;
 typedef smalluint exitcode_t;
 
 #if ENABLE_FEATURE_SYSLOG_INFO
-void bb_info_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
+void bb_info_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2)));
 void bb_simple_info_msg(const char *s) FAST_FUNC;
 void bb_vinfo_msg(const char *s, va_list p) FAST_FUNC;
 #else
@@ -1892,8 +1899,8 @@ int get_termios_and_make_raw(int fd, struct termios *newterm, struct termios *ol
 int set_termios_to_raw(int fd, struct termios *oldterm, int flags) FAST_FUNC;
 
 /* NB: "unsigned request" is crucial! "int request" will break some arches! */
-int ioctl_or_perror(int fd, unsigned request, void *argp, const char *fmt,...) __attribute__ ((format (printf, 4, 5))) FAST_FUNC;
-int ioctl_or_perror_and_die(int fd, unsigned request, void *argp, const char *fmt,...) __attribute__ ((format (printf, 4, 5))) FAST_FUNC;
+int ioctl_or_perror(int fd, unsigned request, void *argp, const char *fmt,...) __attribute__ ((format (printf, 4, 5)));
+int ioctl_or_perror_and_die(int fd, unsigned request, void *argp, const char *fmt,...) __attribute__ ((format (printf, 4, 5)));
 #if ENABLE_IOCTL_HEX2STR_ERROR
 int bb_ioctl_or_warn(int fd, unsigned request, void *argp, const char *ioctl_name) FAST_FUNC;
 int bb_xioctl(int fd, unsigned request, void *argp, const char *ioctl_name) FAST_FUNC;
@@ -2010,6 +2017,7 @@ unsigned size_from_HISTFILESIZE(const char *hp) FAST_FUNC;
 # endif
 typedef const char *get_exe_name_t(int i) FAST_FUNC;
 typedef const char *sh_get_var_t(const char *name) FAST_FUNC;
+typedef int sh_accept_glob_t(const char *name) FAST_FUNC;
 typedef struct line_input_t {
 	int flags;
 	int timeout;
@@ -2023,6 +2031,9 @@ typedef struct line_input_t {
 #  if ENABLE_SHELL_ASH || ENABLE_SHELL_HUSH
 	/* function to fetch additional application-specific names to match */
 	get_exe_name_t *get_exe_name;
+#   if ENABLE_ASH_GLOB_OPTIONS
+	sh_accept_glob_t *sh_accept_glob;
+#   endif
 #  endif
 # endif
 # if (ENABLE_FEATURE_USERNAME_COMPLETION || ENABLE_FEATURE_EDITING_FANCY_PROMPT) \
@@ -2087,6 +2098,10 @@ int read_line_input(const char* prompt, char* command, int maxsize) FAST_FUNC;
 	read_line_input(prompt, command, maxsize)
 #endif
 
+#if ENABLE_PLATFORM_MINGW32
+# undef COMM_LEN
+# define COMM_LEN 32
+#endif
 #ifndef COMM_LEN
 # ifdef TASK_COMM_LEN
 enum { COMM_LEN = TASK_COMM_LEN };
@@ -2426,10 +2441,15 @@ static ALWAYS_INLINE void* not_const_pp(const void *p)
 	);
 	return pp;
 }
+# if !ENABLE_PLATFORM_MINGW32
 # define ASSIGN_CONST_PTR(pptr, v) do { \
 	*(void**)not_const_pp(pptr) = (void*)(v); \
 	barrier(); \
 } while (0)
+#else
+/* On Windows it seems necessary for this to be a function too. */
+void ASSIGN_CONST_PTR(const void *pptr, const void *ptr) FAST_FUNC;
+#endif
 /* XZALLOC_CONST_PTR() is an out-of-line function to prevent
  * clang from reading pointer before it is assigned.
  */

@@ -258,8 +258,14 @@ static NOINLINE const char *get_homedir_or_NULL(void)
 # else
 	home = getenv("HOME");
 # endif
-	if (home != NULL && home[0] != '\0')
+	if (home != NULL && home[0] != '\0') {
+# if ENABLE_PLATFORM_MINGW32
+		char *t = auto_string(xstrdup(home));
+		bs_to_slash(t);
+		home = t;
+# endif
 		return home;
+	}
 
 	if (!got_user_strings)
 		get_user_strings();
@@ -968,8 +974,13 @@ static NOINLINE unsigned complete_cmd_dir_file(const char *command, int type)
 	if (type == FIND_EXE_ONLY && !dirbuf) {
 # if ENABLE_FEATURE_SH_STANDALONE && NUM_APPLETS != 1
 		const char *p = applet_names;
+#  if ENABLE_PLATFORM_MINGW32
+		const char *shpath = state->flags & WITH_PATH_LOOKUP ?
+								state->path_lookup : NULL;
+#  endif
 		while (*p) {
-			if (strncmp(basecmd, p, baselen) == 0 && is_applet_preferred(p))
+			if (strncmp(basecmd, p, baselen) == 0 &&
+					is_applet_preferred(p, shpath))
 				add_match(xstrdup(p), TRUE);
 			while (*p++ != '\0')
 				continue;
@@ -1032,6 +1043,10 @@ static NOINLINE unsigned complete_cmd_dir_file(const char *command, int type)
 				goto cont; /* hmm, remove in progress? */
 
 # if ENABLE_PLATFORM_MINGW32
+#  if ENABLE_ASH_GLOB_OPTIONS
+			if (state->sh_accept_glob && !state->sh_accept_glob(found))
+				goto cont;
+#  endif
 			if (type == FIND_EXE_ONLY && S_ISREG(st.st_mode) &&
 					!(st.st_mode & S_IXUSR))
 				goto cont;
@@ -2660,7 +2675,7 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
 #if !ENABLE_PLATFORM_MINGW32
 	if (n != 0 || (initial_settings.c_lflag & (ECHO|ICANON)) == ICANON) {
 #else
-	if (n != 0 || !isatty(0) || !isatty(1)) {
+	if (n != 0 || !isatty(0)) {
 #endif
 		/* Happens when e.g. stty -echo was run before.
 		 * But if ICANON is not set, we don't come here.
@@ -2671,8 +2686,12 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
 		fflush_all();
 		if (fgets(command, maxsize, stdin) == NULL)
 			len = -1; /* EOF or error */
-		else
+		else {
 			len = strlen(command);
+#if ENABLE_PLATFORM_MINGW32
+			len = remove_cr(command, len);
+#endif
+		}
 		DEINIT_S();
 		return len;
 	}

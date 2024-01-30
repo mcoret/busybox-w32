@@ -100,7 +100,8 @@ static const char packed_scripts[] ALIGN1 = { PACKED_SCRIPTS };
 # define ENABLE_FEATURE_COMPRESS_USAGE 0
 #endif
 
-#if ENABLE_PLATFORM_MINGW32
+#if ENABLE_PLATFORM_MINGW32 && NUM_APPLETS > 1 && \
+		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
 static int really_find_applet_by_name(const char *name);
 #else
 #define really_find_applet_by_name(n) find_applet_by_name(n)
@@ -194,7 +195,8 @@ void FAST_FUNC bb_show_usage(void)
 	xfunc_die();
 }
 
-#if ENABLE_PLATFORM_MINGW32
+#if ENABLE_PLATFORM_MINGW32 && NUM_APPLETS > 1 && \
+		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
 static int really_find_applet_by_name(const char *name)
 #else
 int FAST_FUNC find_applet_by_name(const char *name)
@@ -263,31 +265,36 @@ int FAST_FUNC find_applet_by_name(const char *name)
 	return -1;
 }
 
-#if ENABLE_PLATFORM_MINGW32
-int FAST_FUNC find_applet_by_name(const char *name)
-{
-	int applet_no = really_find_applet_by_name(name);
-	return applet_no >= 0 && is_applet_preferred(name) ? applet_no : -1;
-}
-#endif
-
 #if ENABLE_PLATFORM_MINGW32 && NUM_APPLETS > 1 && \
 		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
-static int external_exists(const char *name)
+int FAST_FUNC find_applet_by_name_with_path(const char *name, const char *path)
 {
-	const char *ash_path = get_ash_path();
-	char *path = ash_path ? auto_string(xstrdup(ash_path)) : getenv("PATH");
-	char *ret = find_executable(name, &path);
+	int applet_no = really_find_applet_by_name(name);
+	return applet_no >= 0 && is_applet_preferred(name, path) ? applet_no : -1;
+}
+
+int FAST_FUNC find_applet_by_name(const char *name)
+{
+	return find_applet_by_name_with_path(name, NULL);
+}
+
+static int external_exists(const char *name, const char *path)
+{
+	char *path0, *path1, *ret;
+
+	path0 = path1 = xstrdup(path ?: getenv("PATH"));
+	ret = find_executable(name, &path1);
 	free(ret);
+	free(path0);
 	return ret != NULL;
 }
 
-int FAST_FUNC is_applet_preferred(const char *name)
+static int is_applet_preferred_by_var(const char *name, const char *path,
+										const char *var)
 {
-	const char *var, *s, *sep;
+	const char *s, *sep;
 	size_t len;
 
-	var = getenv(BB_OVERRIDE_APPLETS);
 	if (var && *var) {
 		/* '-' disables all applets */
 		if (var[0] == '-' && var[1] == '\0')
@@ -295,7 +302,7 @@ int FAST_FUNC is_applet_preferred(const char *name)
 
 		/* '+' each applet is overridden if an external command exists */
 		if (var[0] == '+' && var[1] == '\0')
-			return !external_exists(name);
+			return !external_exists(name, path);
 
 		/* Handle applets from a list separated by spaces, commas or
 		 * semicolons.  Applets before the first semicolon are disabled.
@@ -314,10 +321,21 @@ int FAST_FUNC is_applet_preferred(const char *name)
 			/* neither "..name" nor "..name,xxx"? */
 			if (s[len] != '\0' && !strchr(" ,;", s[len]))
 				continue;
-			return (sep == NULL || s < sep) ? FALSE : !external_exists(name);
+			return (sep == NULL || s < sep) ?
+						FALSE : !external_exists(name, path);
 		}
 	}
 	return TRUE;
+}
+
+int FAST_FUNC is_applet_preferred(const char *name, const char *path)
+{
+	int ret;
+
+	ret = is_applet_preferred_by_var(name, path, getenv(BB_OVERRIDE_APPLETS));
+	if (sizeof(CONFIG_OVERRIDE_APPLETS) > 1 && ret)
+		ret = is_applet_preferred_by_var(name, path, CONFIG_OVERRIDE_APPLETS);
+	return ret;
 }
 #endif
 
@@ -902,7 +920,7 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
 		full_write2_str(" multi-call binary.\n"); /* reuse */
 #endif
 		full_write2_str(
-			"BusyBox is copyrighted by many authors between 1998-2023.\n"
+			"BusyBox is copyrighted by many authors between 1998-2024.\n"
 			"Licensed under GPLv2. See source distribution for detailed\n"
 			"copyright notices.\n"
 			"\n"
@@ -1113,6 +1131,10 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
 		/* We support "busybox /a/path/to/applet args..." too. Allows for
 		 * "#!/bin/busybox"-style wrappers
 		 */
+#  if ENABLE_PLATFORM_MINGW32
+		if (interp)
+			--interp;
+#  endif
 		applet_name = bb_get_last_path_component_nostrip(argv[0]);
 	}
 	run_applet_and_exit(applet_name, argv);

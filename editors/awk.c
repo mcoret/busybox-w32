@@ -40,7 +40,7 @@
 //usage:#define awk_full_usage "\n\n"
 //usage:       "	-v VAR=VAL	Set variable"
 //usage:     "\n	-F SEP		Use SEP as field separator"
-//usage:     "\n	-f FILE		Read program from FILE"
+//usage:     "\n	-f/-E FILE	Read program from FILE"
 //usage:	IF_FEATURE_AWK_GNU_EXTENSIONS(
 //usage:     "\n	-e AWK_PROGRAM"
 //usage:	)
@@ -76,8 +76,8 @@
  * 1: -argz
  */
 #define OPTSTR_AWK "+" \
-	"F:v:*f:*" \
-	IF_FEATURE_AWK_GNU_EXTENSIONS("e:*") \
+	"F:v:f:" \
+	IF_FEATURE_AWK_GNU_EXTENSIONS("e:E:") \
 	"W:"
 enum {
 	OPTBIT_F,	/* define field separator */
@@ -555,11 +555,13 @@ struct globals {
 	//we are reusing ahash as fdhash, via define (see later)
 	const char *g_progname;
 	int g_lineno;
-	int nfields;
-	unsigned maxfields;
+	int num_fields;             /* number of existing $N's */
+	unsigned num_alloc_fields;  /* current size of Fields[] */
+	/* NB: Fields[0] corresponds to $1, not to $0 */
 	var *Fields;
 	char *g_pos;
 	char g_saved_ch;
+	smallint got_program;
 	smallint icase;
 	smallint exiting;
 	smallint nextrec;
@@ -630,11 +632,12 @@ struct globals2 {
 // for fdhash in execution stage.
 #define g_progname   (G1.g_progname  )
 #define g_lineno     (G1.g_lineno    )
-#define nfields      (G1.nfields     )
-#define maxfields    (G1.maxfields   )
+#define num_fields   (G1.num_fields  )
+#define num_alloc_fields (G1.num_alloc_fields)
 #define Fields       (G1.Fields      )
 #define g_pos        (G1.g_pos       )
 #define g_saved_ch   (G1.g_saved_ch  )
+#define got_program  (G1.got_program )
 #define icase        (G1.icase       )
 #define exiting      (G1.exiting     )
 #define nextrec      (G1.nextrec     )
@@ -1964,30 +1967,30 @@ static void fsrealloc(int size)
 {
 	int i, newsize;
 
-	if ((unsigned)size >= maxfields) {
+	if ((unsigned)size >= num_alloc_fields) {
 		/* Sanity cap, easier than catering for over/underflows */
 		if ((unsigned)size > 0xffffff)
 			bb_die_memory_exhausted();
 
-		i = maxfields;
-		maxfields = size + 16;
+		i = num_alloc_fields;
+		num_alloc_fields = size + 16;
 
-		newsize = maxfields * sizeof(Fields[0]);
+		newsize = num_alloc_fields * sizeof(Fields[0]);
 		debug_printf_eval("fsrealloc: xrealloc(%p, %u)\n", Fields, newsize);
 		Fields = xrealloc(Fields, newsize);
 		debug_printf_eval("fsrealloc: Fields=%p..%p\n", Fields, (char*)Fields + newsize - 1);
 		/* ^^^ did Fields[] move? debug aid for L.v getting "upstaged" by R.v in evaluate() */
 
-		for (; i < maxfields; i++) {
-			Fields[i].type = VF_SPECIAL;
+		for (; i < num_alloc_fields; i++) {
+			Fields[i].type = VF_SPECIAL | VF_DIRTY;
 			Fields[i].string = NULL;
 		}
 	}
-	/* if size < nfields, clear extra field variables */
-	for (i = size; i < nfields; i++) {
+	/* if size < num_fields, clear extra field variables */
+	for (i = size; i < num_fields; i++) {
 		clrvar(Fields + i);
 	}
-	nfields = size;
+	num_fields = size;
 }
 
 static int regexec1_nonempty(const regex_t *preg, const char *s, regmatch_t pmatch[])
@@ -2124,7 +2127,7 @@ static void split_f0(void)
 	/* set NF manually to avoid side effects */
 	clrvar(intvar[NF]);
 	intvar[NF]->type = VF_NUMBER | VF_SPECIAL;
-	intvar[NF]->number = nfields;
+	intvar[NF]->number = num_fields;
 #undef fstrings
 }
 
@@ -2908,11 +2911,13 @@ static int next_input_file(void)
 		}
 		fname = getvar_s(findvar(iamarray(intvar[ARGV]), utoa(argind)));
 		if (fname && *fname) {
-			/* "If a filename on the command line has the form
-			 * var=val it is treated as a variable assignment"
-			 */
-			if (try_to_assign(fname))
-				continue;
+			if (got_program != 2) { /* there was no -E option */
+				/* "If a filename on the command line has the form
+				 * var=val it is treated as a variable assignment"
+				 */
+				if (try_to_assign(fname))
+					continue;
+			}
 			iF.F = xfopen_stdin(fname);
 			setvar_i(intvar[ARGIND], argind);
 			break;
@@ -2995,7 +3000,7 @@ static var *evaluate(node *op, var *res)
 				syntax_error(EMSG_TOO_FEW_ARGS);
 			L.v = evaluate(op1, TMPVAR0);
 			/* Does L.v point to $n variable? */
-			if ((size_t)(L.v - Fields) < maxfields) {
+			if ((size_t)(L.v - Fields) < num_alloc_fields) {
 				/* yes, remember where Fields[] is */
 				old_Fields_ptr = Fields;
 			}
@@ -3024,7 +3029,11 @@ static var *evaluate(node *op, var *res)
 			if (old_Fields_ptr) {
 				//if (old_Fields_ptr != Fields)
 				//	debug_printf_eval("L.v moved\n");
+#if !ENABLE_PLATFORM_MINGW32
 				L.v += Fields - old_Fields_ptr;
+#else
+				L.v = Fields + (L.v - old_Fields_ptr);
+#endif
 			}
 			if (opinfo & OF_STR2) {
 				R.s = getvar_s(R.v);
@@ -3549,7 +3558,7 @@ static var *evaluate(node *op, var *res)
 				res = intvar[F0];
 			} else {
 				split_f0();
-				if (i > nfields)
+				if (i > num_fields)
 					fsrealloc(i);
 				res = &Fields[i - 1];
 			}
@@ -3695,13 +3704,7 @@ static int awk_exit(void)
 int awk_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int awk_main(int argc UNUSED_PARAM, char **argv)
 {
-	unsigned opt;
-	char *opt_F;
-	llist_t *list_v = NULL;
-	llist_t *list_f = NULL;
-#if ENABLE_FEATURE_AWK_GNU_EXTENSIONS
-	llist_t *list_e = NULL;
-#endif
+	int ch;
 	int i;
 
 	INIT_G();
@@ -3750,52 +3753,71 @@ int awk_main(int argc UNUSED_PARAM, char **argv)
 			}
 		}
 	}
-	opt = getopt32(argv, OPTSTR_AWK, &opt_F, &list_v, &list_f, IF_FEATURE_AWK_GNU_EXTENSIONS(&list_e,) NULL);
-	argv += optind;
-	//argc -= optind;
-	if (opt & OPT_W)
-		bb_simple_error_msg("warning: option -W is ignored");
-	if (opt & OPT_F) {
-		unescape_string_in_place(opt_F);
-		setvar_s(intvar[FS], opt_F);
-	}
-	while (list_v) {
-		if (!try_to_assign(llist_pop(&list_v)))
-			bb_show_usage();
-	}
 
-	/* Parse all supplied programs */
 	fnhash = hash_init();
 	ahash = hash_init();
-	while (list_f) {
-		int fd;
-		char *s;
 
-		g_progname = llist_pop(&list_f);
-		fd = xopen_stdin(g_progname);
+	/* Cannot use getopt32: need to preserve order of -e / -f / -E / -i */
+	while ((ch = getopt(argc, argv, OPTSTR_AWK)) >= 0) {
+		switch (ch) {
+		case 'F':
+			unescape_string_in_place(optarg);
+			setvar_s(intvar[FS], optarg);
+			break;
+		case 'v':
+			if (!try_to_assign(optarg))
+				bb_show_usage();
+			break;
+//TODO: implement -i LIBRARY, it is easy-ish
+		case 'E':
+		case 'f':  {
+			int fd;
+			char *s;
+			g_progname = optarg;
+			fd = xopen_stdin(g_progname);
 #if ENABLE_PLATFORM_MINGW32
-		_setmode(fd, _O_TEXT);
+			_setmode(fd, _O_TEXT);
 #endif
-		s = xmalloc_read(fd, NULL); /* it's NUL-terminated */
-		if (!s)
-			bb_perror_msg_and_die("read error from '%s'", g_progname);
-		close(fd);
-		parse_program(s);
-		free(s);
-	}
-	g_progname = "cmd. line";
+			s = xmalloc_read(fd, NULL); /* it's NUL-terminated */
+			if (!s)
+				bb_perror_msg_and_die("read error from '%s'", g_progname);
+			close(fd);
+			parse_program(s);
+			free(s);
+			got_program = 1;
+			if (ch == 'E') {
+				got_program = 2;
+				goto stop_option_parsing;
+			}
+			break;
+		}
 #if ENABLE_FEATURE_AWK_GNU_EXTENSIONS
-	while (list_e) {
-		parse_program(llist_pop(&list_e));
-	}
+		case 'e':
+			g_progname = "cmd. line";
+			parse_program(optarg);
+			got_program = 1;
+			break;
 #endif
-//FIXME: preserve order of -e and -f
-//TODO: implement -i LIBRARY and -E FILE too, they are easy-ish
-	if (!(opt & (OPT_f | OPT_e))) {
+		case 'W':
+			bb_simple_error_msg("warning: option -W is ignored");
+			break;
+		default:
+//bb_error_msg("ch:%d", ch);
+			bb_show_usage();
+		}
+	}
+ stop_option_parsing:
+
+	argv += optind;
+	//argc -= optind;
+
+	if (!got_program) {
 		if (!*argv)
 			bb_show_usage();
+		g_progname = "cmd. line";
 		parse_program(*argv++);
 	}
+
 	/* Free unused parse structures */
 	//hash_free(fnhash); // ~250 bytes when empty, used only for function names
 	//^^^^^^^^^^^^^^^^^ does not work, hash_clear() inside SEGVs

@@ -357,7 +357,7 @@ static inline mode_t file_attr_to_st_mode(DWORD attr)
 
 static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 {
-	size_t len;
+	char *want_dir;
 
 	if (get_dev_type(fname) != NOT_DEVICE || get_dev_fd(fname) >= 0) {
 		/* Fake attributes for special devices */
@@ -369,7 +369,10 @@ static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 		return 0;
 	}
 
+	want_dir = last_char_is_dir_sep(fname);
 	if (GetFileAttributesExA(fname, GetFileExInfoStandard, fdata)) {
+		if (!(fdata->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && want_dir)
+			return ENOTDIR;
 		fdata->dwFileAttributes &= ~FILE_ATTRIBUTE_DEVICE;
 		return 0;
 	}
@@ -402,8 +405,7 @@ static int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fdata)
 	case ERROR_NOT_ENOUGH_MEMORY:
 		return ENOMEM;
 	case ERROR_INVALID_NAME:
-		len = strlen(fname);
-		if (len > 1 && (fname[len-1] == '/' || fname[len-1] == '\\'))
+		if (want_dir)
 			return ENOTDIR;
 	default:
 		return ENOENT;
@@ -2292,28 +2294,19 @@ int chdir_system_drive(void)
  * This function is used to make relative paths absolute before a call
  * to chdir_system_drive().  It's unlikely to be useful in other cases.
  *
- * If the argument is an absolute path or a relative path which resolves
- * to a path on the system drive return 'path'.  If it's a relative path
- * which resolves to a path that isn't on the system drive return an
- * allocated string containing the resolved path.  Die on failure,
+ * If the argument is an absolute path return 'path', otherwise return
+ * an allocated string containing the resolved path.  Die on failure,
  * which is most likely because the file doesn't exist.
  */
 char *xabsolute_path(char *path)
 {
 	char *rpath;
-	const char *sd;
 
 	if (root_len(path) != 0)
 		return path;	// absolute path
 	rpath = xmalloc_realpath(path);
-	if (rpath) {
-		sd = get_system_drive();
-		if (sd && is_prefixed_with_case(rpath, sd)) {
-			free(rpath);
-			return path;	// resolved path is on system drive
-		}
+	if (rpath)
 		return rpath;
-	}
 	bb_perror_msg_and_die("can't open '%s'", path);
 }
 

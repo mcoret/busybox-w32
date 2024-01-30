@@ -196,19 +196,24 @@
 //config:	application.  This may be useful when running a shell script
 //config:	from a GUI application.
 //config:
-//config:config ASH_NOCASEGLOB
-//config:	bool "'nocaseglob' option"
+//config:config ASH_GLOB_OPTIONS
+//config:	bool "Globbing options"
 //config:	default y
 //config:	depends on (ASH || SH_IS_ASH || BASH_IS_ASH) && PLATFORM_MINGW32
 //config:	help
-//config:	Enable support for the 'nocaseglob' option, which allows
-//config:	case-insensitive filename globbing.
+//config:	Enable support for options to control globbing:
+//config:	- 'nocaseglob' allows case-insensitive filename globbing
+//config:	- 'nohiddenglob' allows hidden files to be omitted from globbing
+//config:	- 'nohidsysglob' allows hidden system files to be omitted
 //config:
 //config:endif # ash options
 
 //applet:IF_ASH(APPLET(ash, BB_DIR_BIN, BB_SUID_DROP))
 //                      APPLET_ODDNAME:name  main location    suid_type     help
 //applet:IF_SH_IS_ASH(  APPLET_ODDNAME(sh,   ash, BB_DIR_BIN, BB_SUID_DROP, ash))
+//applet:IF_PLATFORM_MINGW32(
+//applet:IF_SH_IS_ASH(  APPLET_ODDNAME(lash, ash, BB_DIR_BIN, BB_SUID_DROP, ash))
+//applet:)
 //applet:IF_BASH_IS_ASH(APPLET_ODDNAME(bash, ash, BB_DIR_BIN, BB_SUID_DROP, ash))
 
 //kbuild:lib-$(CONFIG_SHELL_ASH) += ash.o ash_ptr_hack.o shell_common.o
@@ -447,47 +452,6 @@ static void forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 # endif
 #endif
 
-#if ENABLE_PLATFORM_MINGW32 && NUM_APPLETS > 1 && \
-		(ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE)
-static const char *ash_path;
-
-const char *
-get_ash_path(void)
-{
-	return ash_path;
-}
-
-static int NOINLINE
-ash_applet_by_name(const char *name, const char *path)
-{
-	int ret;
-
-	ash_path = path;
-	ret = find_applet_by_name(name);
-	ash_path = NULL;
-
-	return ret;
-}
-
-static int
-ash_applet_preferred(const char *name, const char *path)
-{
-	int ret;
-
-	ash_path = path;
-	ret = is_applet_preferred(name);
-	ash_path = NULL;
-
-	return ret;
-}
-# define find_applet_by_name(n, p) ash_applet_by_name(n, p)
-# define is_applet_preferred(n, p) ash_applet_preferred(n, p)
-#else
-# define find_applet_by_name(n, p) find_applet_by_name(n)
-# undef is_applet_preferred
-# define is_applet_preferred(n, p) (1)
-#endif
-
 /* ============ Hash table sizes. Configurable. */
 
 #define VTABSIZE 39
@@ -542,8 +506,10 @@ static const char *const optletters_optnames[] ALIGN_PTR = {
 #if ENABLE_ASH_NOCONSOLE
 	,"\0"  "noconsole"
 #endif
-#if ENABLE_ASH_NOCASEGLOB
+#if ENABLE_ASH_GLOB_OPTIONS
 	,"\0"  "nocaseglob"
+	,"\0"  "nohiddenglob"
+	,"\0"  "nohidsysglob"
 #endif
 };
 //bash 4.4.23 also has these opts (with these defaults):
@@ -670,8 +636,10 @@ struct globals_misc {
 # if ENABLE_ASH_NOCONSOLE
 #  define noconsole optlist[17 + BASH_PIPEFAIL + 2*(DEBUG != 0)]
 # endif
-# if ENABLE_ASH_NOCASEGLOB
+# if ENABLE_ASH_GLOB_OPTIONS
 #  define nocaseglob optlist[17 + BASH_PIPEFAIL + 2*(DEBUG != 0) + ENABLE_ASH_NOCONSOLE]
+#  define nohiddenglob optlist[18 + BASH_PIPEFAIL + 2*(DEBUG != 0) + ENABLE_ASH_NOCONSOLE]
+#  define nohidsysglob optlist[19 + BASH_PIPEFAIL + 2*(DEBUG != 0) + ENABLE_ASH_NOCONSOLE]
 # endif
 #endif
 
@@ -952,7 +920,8 @@ raise_interrupt(void)
 		signal(SIGINT, SIG_DFL);
 		raise(SIGINT);
 #else
-		exit(SIGINT << 24);
+		fflush_all();
+		_exit(SIGINT << 24);
 #endif
 	}
 #if ENABLE_PLATFORM_MINGW32
@@ -4956,7 +4925,7 @@ waitpid_child(int *status, int wait_flags)
 	HANDLE *proclist;
 	pid_t pid = -1;
 	DWORD win_status, idx;
-	int i, sig;
+	int i;
 
 	for (jb = curjob; jb; jb = jb->prev_job) {
 		if (jb->state != JOBDONE)
@@ -4988,18 +4957,7 @@ waitpid_child(int *status, int wait_flags)
 				wait_flags&WNOHANG ? 1 : INFINITE);
 	if (idx < pid_nr) {
 		GetExitCodeProcess(proclist[idx], &win_status);
-		if (win_status == 0xc0000005)
-			win_status = SIGSEGV << 24;
-		else if (win_status == 0xc000013a)
-			win_status = SIGINT << 24;
-
-		// When a process is terminated as if by a signal the exit
-		// code is zero apart from the signal in its topmost byte.
-		sig = win_status >> 24;
-		if (sig != 0 && win_status == sig << 24 && is_valid_signal(sig))
-			*status = sig;
-		else
-			*status = (int)win_status << 8;
+		*status = exit_code_to_wait_status(win_status);
 		pid = pidlist[idx];
 	}
  done:
@@ -8685,6 +8643,26 @@ expandmeta(struct strlist *str /*, int flag*/)
 #else
 /* ENABLE_ASH_INTERNAL_GLOB: Homegrown globbing code. (dash also has both, uses homegrown one.) */
 
+#if ENABLE_ASH_GLOB_OPTIONS
+static int FAST_FUNC
+ash_accept_glob(const char *name)
+{
+	struct stat st;
+
+	if (nohiddenglob || nohidsysglob) {
+		if (!lstat(name, &st)) {
+			if ((st.st_attr & FILE_ATTRIBUTE_HIDDEN)) {
+				if (nohiddenglob ||
+						(st.st_attr & FILE_ATTRIBUTE_SYSTEM)) {
+					return FALSE;
+				}
+			}
+		}
+	}
+	return TRUE;
+}
+#endif
+
 /*
  * Do metacharacter (i.e. *, ?, [...]) expansion.
  */
@@ -8790,12 +8768,16 @@ expmeta(exp_t *exp, char *name, unsigned name_len, unsigned expdir_len)
 	while (!pending_int && (dp = readdir(dirp)) != NULL) {
 		if (dp->d_name[0] == '.' && !matchdot)
 			continue;
-#if ENABLE_ASH_NOCASEGLOB
+#if ENABLE_ASH_GLOB_OPTIONS
 # undef pmatch
 # define pmatch(a, b) !fnmatch((a), (b), nocaseglob ? FNM_CASEFOLD : 0)
 #endif
 		if (pmatch(start, dp->d_name)) {
 			if (atend) {
+#if ENABLE_ASH_GLOB_OPTIONS
+				if (!ash_accept_glob(dp->d_name))
+					continue;
+#endif
 				strcpy(enddir, dp->d_name);
 				addfname(expdir);
 			} else {
@@ -8823,7 +8805,7 @@ expmeta(exp_t *exp, char *name, unsigned name_len, unsigned expdir_len)
 		endname[-esc - 1] = esc ? '\\' : '/';
 #undef expdir
 #undef expdir_max
-#if ENABLE_ASH_NOCASEGLOB
+#if ENABLE_ASH_GLOB_OPTIONS
 # undef pmatch
 # define pmatch(a, b) !fnmatch((a), (b), 0)
 #endif
@@ -9124,7 +9106,7 @@ tryexec(IF_FEATURE_SH_STANDALONE(int applet_no,) const char *cmd, char **argv, c
 # else
 		if (APPLET_IS_NOEXEC(applet_no)) {
 # endif
-#if ENABLE_PLATFORM_MINGW32 && !defined(_UCRT)
+#if !ENABLE_PLATFORM_MINGW32 || !defined(_UCRT)
 			/* If building for UCRT move this up into shellexec() to
 			 * work around a bug. */
 			clearenv();
@@ -9201,7 +9183,7 @@ static void shellexec(char *prog, char **argv, const char *path, int idx)
 	int applet_no = -1; /* used only by FEATURE_SH_STANDALONE */
 
 	envp = listvars(VEXPORT, VUNSET, /*strlist:*/ NULL, /*end:*/ NULL);
-#if ENABLE_PLATFORM_MINGW32 && defined(_UCRT)
+#if ENABLE_FEATURE_SH_STANDALONE && ENABLE_PLATFORM_MINGW32 && defined(_UCRT)
 	/* Avoid UCRT bug by updating parent's environment and passing a
 	 * NULL environment pointer to execve(). */
 	clearenv();
@@ -9215,7 +9197,7 @@ static void shellexec(char *prog, char **argv, const char *path, int idx)
 	if (has_path(prog)
 #endif
 #if ENABLE_FEATURE_SH_STANDALONE
-	 || (applet_no = find_applet_by_name(prog, path)) >= 0
+	 || (applet_no = find_applet_by_name_with_path(prog, path)) >= 0
 #endif
 	) {
 #if ENABLE_PLATFORM_MINGW32
@@ -9236,7 +9218,7 @@ static void shellexec(char *prog, char **argv, const char *path, int idx)
 		if (unix_path(prog)) {
 			const char *name = bb_basename(prog);
 # if ENABLE_FEATURE_SH_STANDALONE
-			if ((applet_no = find_applet_by_name(name, path)) >= 0) {
+			if ((applet_no = find_applet_by_name_with_path(name, path)) >= 0) {
 				tryexec(applet_no, name, argv, envp);
 				e = errno;
 			}
@@ -9860,9 +9842,11 @@ static void *funcblock;         /* block to allocate function from */
 static char *funcstring_end;    /* end of block to allocate strings from */
 #if ENABLE_PLATFORM_MINGW32
 static int fs_size;
-# if FORKSHELL_DEBUG
 static void *fs_start;
+# if FORKSHELL_DEBUG
+static void *fs_funcstring;
 static const char **annot;
+static char *annot_free;
 # endif
 #endif
 
@@ -10011,38 +9995,57 @@ static union node *copynode(union node *);
 
 #if ENABLE_PLATFORM_MINGW32
 # if FORKSHELL_DEBUG
-#  define FREE 1
-#  define NO_FREE 2
-#  define ANNOT(dst,note) { \
-		if (annot) \
-			annot[(char *)&dst - (char *)fs_start] = note; \
-	}
+#  define MARK_PTR(dst,note,flag) forkshell_mark_ptr((void *)&dst, note, flag)
 # else
-#  define FREE 1
-#  define NO_FREE 1
-#  define ANNOT(dst,note)
+#  define MARK_PTR(dst,note,flag) forkshell_mark_ptr((void *)&dst)
 # endif
 
-/* The relocation map is offset from the start of the forkshell data
- * block by 'fs_size' bytes.  The flag relating to a particular destination
- * pointer is thus at (dst+fs_size). */
-# define MARK_PTR(dst,flag) {*((char *)&dst + fs_size) = flag;}
+#define NO_FREE 0
+#define FREE 1
+
+#if FORKSHELL_DEBUG
+static void forkshell_mark_ptr(void *dst, const char *note, int flag)
+#else
+static void forkshell_mark_ptr(void *dst)
+#endif
+{
+	char *lrelocate = (char *)fs_start + fs_size;
+	int index = ((char *)dst - (char *)fs_start)/sizeof(char *);
+
+	lrelocate[index/8] |= 1 << (index % 8);
+
+#if FORKSHELL_DEBUG
+	if (dst < fs_start || dst >= fs_funcstring) {
+		fprintf(stderr, "dst (%p) out of range (%p %p)\n",
+				dst, fs_start, fs_funcstring);
+	}
+	if (annot) {
+		if (annot[index]) {
+			fprintf(stderr, "duplicate annotation: %s %s\n",
+						annot[index], note);
+		}
+		annot[index] = note;
+		annot_free[index] = flag;
+	}
+#endif
+}
 
 # define SAVE_PTR(dst,note,flag) { \
 	if (fs_size) { \
-		MARK_PTR(dst,flag); ANNOT(dst,note); \
+		MARK_PTR(dst,note,flag); \
 	} \
 }
 # define SAVE_PTR2(dst1,note1,flag1,dst2,note2,flag2) { \
 	if (fs_size) { \
-		MARK_PTR(dst1,flag1); MARK_PTR(dst2,flag2); \
-		ANNOT(dst1,note1); ANNOT(dst2,note2); \
+		MARK_PTR(dst1,note1,flag1); \
+		MARK_PTR(dst2,note2,flag2); \
 	} \
 }
 # define SAVE_PTR3(dst1,note1,flag1,dst2,note2,flag2,dst3,note3,flag3) { \
 	if (fs_size) { \
-		MARK_PTR(dst1,flag1); MARK_PTR(dst2,flag2); MARK_PTR(dst3,flag3); \
-		ANNOT(dst1,note1); ANNOT(dst2,note2); ANNOT(dst3,note3); \
+		MARK_PTR(dst1,note1,flag1); \
+		MARK_PTR(dst2,note2,flag2); \
+		MARK_PTR(dst3,note3,flag3); \
 	} \
 }
 #else
@@ -10872,6 +10875,9 @@ setinteractive(int on)
 			line_input_state = new_line_input_t(FOR_SHELL | WITH_PATH_LOOKUP);
 # if ENABLE_FEATURE_TAB_COMPLETION
 			line_input_state->get_exe_name = ash_command_name;
+#  if ENABLE_ASH_GLOB_OPTIONS
+			line_input_state->sh_accept_glob = ash_accept_glob;
+#  endif
 # endif
 # if EDITING_HAS_sh_get_var
 			line_input_state->sh_get_var = lookupvar;
@@ -11656,9 +11662,10 @@ evalcommand(union node *cmd, int flags)
 
 	default: {
 
+//TODO: find a better solution for Windows on ARM than ignoring NOFORK
 #if ENABLE_FEATURE_SH_STANDALONE \
  && ENABLE_FEATURE_SH_NOFORK \
- && NUM_APPLETS > 1
+ && NUM_APPLETS > 1 && !(defined(_ARM64_) && ENABLE_PLATFORM_MINGW32)
 /* (1) BUG: if variables are set, we need to fork, or save/restore them
  *     around run_nofork_applet() call.
  * (2) Should this check also be done in forkshell()?
@@ -15048,7 +15055,7 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 			name = (char *)bb_basename(name);
 			if (
 # if ENABLE_FEATURE_SH_STANDALONE
-					find_applet_by_name(name, path) >= 0 ||
+					find_applet_by_name_with_path(name, path) >= 0 ||
 # endif
 					!find_builtin(bb_basename(name))
 			) {
@@ -15119,7 +15126,7 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 
 #if ENABLE_FEATURE_SH_STANDALONE
 	{
-		int applet_no = find_applet_by_name(name, path);
+		int applet_no = find_applet_by_name_with_path(name, path);
 		if (applet_no >= 0) {
 			entry->cmdtype = CMDNORMAL;
 			entry->u.index = -2 - applet_no;
@@ -15857,7 +15864,7 @@ init(void)
 	int import = 0;
 #else
 	/* we will never free this */
-	basepf.next_to_pgetc = basepf.buf = ckmalloc(IBUFSIZ);
+	basepf.next_to_pgetc = basepf.buf = ckzalloc(IBUFSIZ);
 	basepf.linno = 1;
 
 	sigmode[SIGCHLD - 1] = S_DFL; /* ensure we install handler even if it is SIG_IGNed */
@@ -15999,7 +16006,11 @@ procargs(char **argv)
 	int login_sh;
 
 	xargv = argv;
+#if ENABLE_PLATFORM_MINGW32
+	login_sh = applet_name[0] == 'l';
+#else
 	login_sh = xargv[0] && xargv[0][0] == '-';
+#endif
 #if NUM_SCRIPTS > 0
 	if (minusc)
 		goto setarg0;
@@ -16123,7 +16134,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 	INIT_G_memstack();
 
 	/* from init() */
-	basepf.next_to_pgetc = basepf.buf = ckmalloc(IBUFSIZ);
+	basepf.next_to_pgetc = basepf.buf = ckzalloc(IBUFSIZ);
 	basepf.linno = 1;
 
 	if (argc == 3 && !strcmp(argv[1], "--fs")) {
@@ -16533,7 +16544,7 @@ spawn_forkshell(struct forkshell *fs, struct job *jp, union node *n, int mode)
 #undef SAVE_PTR
 #undef SAVE_PTR2
 #undef SAVE_PTR3
-#define SAVE_PTR(dst,note,flag) {MARK_PTR(dst,flag); ANNOT(dst,note);}
+#define SAVE_PTR(dst,note,flag) {MARK_PTR(dst,note,flag);}
 
 static int align_len(const char *s)
 {
@@ -16853,8 +16864,10 @@ jobtab_copy(void)
 					xasprintf("jobtab[%d].ps0.ps_cmd '%s'",
 								i, jobtab[i].ps0.ps_cmd), FREE);
 			new[i].ps = &new[i].ps0;
-		} else {
+		} else if (jobtab[i].nprocs) {
 			new[i].ps = procstat_copy(i);
+		} else {
+			new[i].ps = NULL;
 		}
 		SAVE_PTR(new[i].ps, xasprintf("jobtab[%d].ps", i), FREE);
 
@@ -17069,12 +17082,14 @@ forkshell_copy(struct forkshell *fs, struct forkshell *new)
 		}
 #endif
 #if JOBS_WIN32
-		new->jobtab = jobtab_copy();
-		SAVE_PTR(new->jobtab, "jobtab", NO_FREE);
-		new->njobs = njobs;
-		if (curjob) {
-			new->curjob = new->jobtab + (curjob - jobtab);
-			SAVE_PTR(new->curjob, "curjob", NO_FREE);
+		if (njobs) {
+			new->jobtab = jobtab_copy();
+			SAVE_PTR(new->jobtab, "jobtab", NO_FREE);
+			new->njobs = njobs;
+			if (curjob) {
+				new->curjob = new->jobtab + (curjob - jobtab);
+				SAVE_PTR(new->curjob, "curjob", NO_FREE);
+			}
 		}
 #endif
 	}
@@ -17093,7 +17108,7 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 	char *lfuncstring;
 	char *lrelocate;
 	char *s;
-	int count, i, total;
+	int count, i, total, bitmapsize;
 	int size[NUM_BLOCKS];
 	char *lptr[NUM_BLOCKS+1];
 	const char *fsname[] = {
@@ -17116,12 +17131,13 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 			return;
 	}
 
+	bitmapsize = (fs->relocatesize + 7)/8;
 	total = sizeof(struct forkshell) + fs->funcblocksize +
-				fs->funcstringsize + fs->relocatesize;
+				fs->funcstringsize + bitmapsize;
 	fprintf(fp, "total size    %6d = %d + %d + %d + %d = %d\n",
-				fs->size + fs->relocatesize,
+				fs->size + bitmapsize,
 				(int)sizeof(struct forkshell), fs->funcblocksize,
-				fs->funcstringsize, fs->relocatesize, total);
+				fs->funcstringsize, bitmapsize, total);
 
 	lfuncblock = (char *)(fs + 1);
 	lfuncstring = (char *)lfuncblock + fs->funcblocksize;
@@ -17166,8 +17182,8 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 	fprintf(fp, "--- relocate ---\n");
 	count = 0;
 	for (i = 0; i < fs->relocatesize; ++i) {
-		if (lrelocate[i]) {
-			char **ptr = (char **)((char *)fs + i);
+		if (lrelocate[i/8] & (1 << i % 8)) {
+			char **ptr = (char **)((char *)fs + i * sizeof(char *));
 			fprintf(fp, "%p %p %s\n", ptr, *ptr,
 					notes && notes[i] ? notes[i] : "");
 			++count;
@@ -17199,7 +17215,7 @@ forkshell_prepare(struct forkshell *fs)
 {
 	struct forkshell *new;
 	struct datasize ds;
-	int size, relocatesize;
+	int size, relocatesize, bitmapsize;
 	HANDLE h;
 	SECURITY_ATTRIBUTES sa;
 #if FORKSHELL_DEBUG
@@ -17212,7 +17228,8 @@ forkshell_prepare(struct forkshell *fs)
 	/* calculate size of structure, funcblock and funcstring */
 	ds = forkshell_size(fs);
 	size = sizeof(struct forkshell) + ds.funcblocksize + ds.funcstringsize;
-	relocatesize = sizeof(struct forkshell) + ds.funcblocksize;
+	relocatesize = (sizeof(struct forkshell) + ds.funcblocksize)/sizeof(char *);
+	bitmapsize = (relocatesize + 7)/8;
 
 	/* Allocate shared memory region */
 	memset(&sa, 0, sizeof(sa));
@@ -17220,19 +17237,21 @@ forkshell_prepare(struct forkshell *fs)
 	sa.lpSecurityDescriptor = NULL;
 	sa.bInheritHandle = TRUE;
 	h = CreateFileMapping(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
-			size+relocatesize, NULL);
+			size+bitmapsize, NULL);
 
 	/* Initialise pointers */
 	new = (struct forkshell *)MapViewOfFile(h, FILE_MAP_WRITE, 0,0, 0);
 	if (new == NULL)
 		return NULL;
 	fs_size = size;
+	fs_start = new;
 	funcblock = (char *)(new + 1);
 	funcstring_end = (char *)new + size;
 #if FORKSHELL_DEBUG
-	fs_start = new;
+	fs_funcstring = (char *)new + sizeof(struct forkshell) + ds.funcblocksize;
 	relocate = (char *)new + size;
 	annot = (const char **)xzalloc(sizeof(char *)*relocatesize);
+	annot_free = xzalloc(relocatesize);
 #endif
 
 	/* Now pack them all */
@@ -17258,22 +17277,17 @@ forkshell_prepare(struct forkshell *fs)
 				new->funcstringsize);
 		if ((char *)funcblock != funcstring_end)
 			fprintf(fp, "   funcstring != end funcblock + 1 %p\n", funcblock);
-		fprintf(fp, "relocate    %p  %6d\n\n", relocate, new->relocatesize);
+		fprintf(fp, "relocate    %p  %6d\n\n", relocate, bitmapsize);
 
 		forkshell_print(fp, new, annot);
 
 		for (i = 0; i < relocatesize; ++i) {
-			/* check relocations are only present for structure and funcblock */
-			if (i >= sizeof(*new)+new->funcblocksize && annot[i] != NULL) {
-				fprintf(fp, "\nnon-NULL annotation at offset %d (> %d) %s\n",
-						i, (int)sizeof(*new)+new->funcblocksize, annot[i]);
-				break;
-			}
-			if (relocate[i] == FREE) {
+			if (annot_free[i]) {
 				free((void *)annot[i]);
 			}
 		}
 		free(annot);
+		free(annot_free);
 		annot = NULL;
 		fclose(fp);
 	}
@@ -17288,8 +17302,6 @@ forkshell_init(const char *idstr)
 	struct forkshell *fs;
 	void *map_handle;
 	HANDLE h;
-	struct globals_var **gvpp;
-	struct globals_misc **gmpp;
 	int i;
 	char **ptr;
 	char *lrelocate;
@@ -17310,8 +17322,8 @@ forkshell_init(const char *idstr)
 	/* pointer fixup */
 	lrelocate = (char *)fs + fs->size;
 	for (i = 0; i < fs->relocatesize; i++) {
-		if (lrelocate[i]) {
-			ptr = (char **)((char *)fs + i);
+		if (lrelocate[i/8] & (1 << i % 8)) {
+			ptr = (char **)((char *)fs + i * sizeof(char *));
 			if (*ptr)
 				*ptr = (char *)fs + (*ptr - fs->old_base);
 		}
@@ -17332,10 +17344,8 @@ forkshell_init(const char *idstr)
 	fs->gmp->trap_ptr = fs->gmp->trap;
 
 	/* Set global variables */
-	gvpp = (struct globals_var **)&ash_ptr_to_globals_var;
-	*gvpp = fs->gvp;
-	gmpp = (struct globals_misc **)&ash_ptr_to_globals_misc;
-	*gmpp = fs->gmp;
+	ASSIGN_CONST_PTR(&ash_ptr_to_globals_var, fs->gvp);
+	ASSIGN_CONST_PTR(&ash_ptr_to_globals_misc, fs->gmp);
 	cmdtable = fs->cmdtable;
 #if ENABLE_ASH_ALIAS
 	atab = fs->atab;	/* will be NULL for FS_SHELLEXEC */
