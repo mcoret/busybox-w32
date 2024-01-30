@@ -20,7 +20,7 @@ jobs:
           docker run --name hi -d fedora:39 sleep infinity
           docker cp ./ci.sh hi:/ci.sh
           docker cp . hi:/busybox-w32
-          docker exec hi sh -c 'chmod +x /ci.sh ; /ci.sh'
+          docker exec hi sh -c 'chmod +x /ci.sh && /ci.sh'
           docker cp hi:/busybox-w32/busybox.exe busybox.exe
       - name: Release
         uses: softprops/action-gh-release@v1
