@@ -15,7 +15,7 @@ jobs:
           docker cp . fedora:/busybox-w32
           cat >ci.sh<<EOF
             # rm -rf \`find /etc/yum.repos.d -not -name 'fedora.repo' -not -name 'fedora-updates.repo' -not -name 'yum.repos.d'\`
-            podman exec fedora find /etc/yum.repos.d -not -name 'fedora.repo' -not -name 'fedora-updates.repo' -not -name 'yum.repos.d' -print0 | xargs -0 rm -rf
+            find /etc/yum.repos.d -not -name 'fedora.repo' -not -name 'fedora-updates.repo' -not -name 'yum.repos.d' -print0 | xargs -0 rm -rf
             dnf install mingw64-gcc mingw64-windows-default-manifest diffutils gcc make ncurses-devel perl-Pod-Html bzip2 -y --setopt=install_weak_deps=False --setopt=max_parallel_downloads=8 --setopt=fastestmirror=True
             cd busybox-w32
             make mingw64_defconfig
